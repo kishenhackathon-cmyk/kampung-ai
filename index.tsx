@@ -39,6 +39,12 @@ interface Quest {
   status: 'active' | 'completed' | 'available';
   type: 'exploration' | 'community' | 'emergency' | 'fitness';
   checkIns?: CheckInPhoto[];
+  navigationSteps?: Array<{
+    instruction: string;
+    distance: string;
+    duration: string;
+  }>;
+  currentStepIndex?: number;
 }
 
 interface Waypoint {
@@ -115,13 +121,16 @@ Respond in the language that you hear
    - Set shouldRespond to true ONLY for concerning moods (distressed, scared, crying, anxious)
    - After calling analyzeMood: If shouldRespond is false, DO NOT generate any audio or text response - stay silent
    - Only if shouldRespond is true, then speak with concern: "Aiyo, you look worried lah. Got problem? Tell uncle/auntie."
-4. Quest & Navigation: PROACTIVELY help users navigate when they mention ANY destination
+4. Quest & Navigation: PROACTIVELY help users navigate with step-by-step directions
    - IMPORTANT: When user mentions wanting to go somewhere, IMMEDIATELY create a quest
    - Listen for: "I want to go to", "bring me to", "where is", "how to get to", "navigate to"
    - Common places: kopitiam, hawker center, MRT station, bus stop, market, mall, clinic, park
    - Response example: "Okay can! I bring you to [place]. Creating your quest now ah!"
    - During navigation: Give turn-by-turn directions in Singlish
+   - When user asks "where do I go?", "what's next?", "which way?": Call 'getNextNavigationStep' and read the instruction
+   - When providing directions: Read out each step clearly, e.g., "Turn right at Market Street, walk 200 meters"
    - At checkpoints: "Wah steady! You reach checkpoint already! Continue straight lor"
+   - Update progress: When user asks for directions, call 'getActiveQuestStatus' to get current step
    - When complete: "Shiok! You reach your destination! Well done!"
 
 Tools:
@@ -1177,6 +1186,11 @@ const AppContent = () => {
                   },
                   required: ["mood", "confidence"]
                 }
+              },
+              {
+                name: "getNextNavigationStep",
+                description: "Get the current navigation instruction when user asks 'where do I go?', 'what's next?', 'which way?', or similar navigation questions during an active quest.",
+                parameters: { type: Type.OBJECT, properties: {} }
               }
             ]
           }]
@@ -1269,21 +1283,72 @@ const AppContent = () => {
                                      if (status === google.maps.places.PlacesServiceStatus.OK && results && results[0]) {
                                          const place = results[0];
                                          const newQuest = generateQuestFromDestination(place, location);
-                                         setQuests(prev => [...prev, newQuest]);
-                                         setActiveQuest({ ...newQuest, status: 'active' });
-                                         setMode('quest');
-                                         setQuestView('map');
                                          
-                                         result = {
-                                             success: true,
-                                             message: `Quest created to ${place.name}! Distance: ${newQuest.distance} km, estimated time: ${newQuest.duration} minutes. Follow the green route on the map!`,
-                                             questDetails: {
-                                                 destination: place.name,
-                                                 distance: newQuest.distance,
-                                                 duration: newQuest.duration,
-                                                 reward: newQuest.reward
-                                             }
+                                         // Fetch step-by-step directions
+                                         const directionsService = new google.maps.DirectionsService();
+                                         const directionsRequest: google.maps.DirectionsRequest = {
+                                             origin: new google.maps.LatLng(location.lat, location.lng),
+                                             destination: new google.maps.LatLng(
+                                                 place.geometry?.location?.lat() || 0,
+                                                 place.geometry?.location?.lng() || 0
+                                             ),
+                                             travelMode: google.maps.TravelMode.WALKING,
+                                             unitSystem: google.maps.UnitSystem.METRIC
                                          };
+                                         
+                                         directionsService.route(directionsRequest, (dirResult, dirStatus) => {
+                                             if (dirStatus === 'OK' && dirResult) {
+                                                 const steps = dirResult.routes[0].legs[0].steps.map((step: any) => ({
+                                                     instruction: step.instructions.replace(/<[^>]*>/g, ''), // Remove HTML tags
+                                                     distance: step.distance.text,
+                                                     duration: step.duration.text
+                                                 }));
+                                                 
+                                                 const questWithNav = {
+                                                     ...newQuest,
+                                                     navigationSteps: steps,
+                                                     currentStepIndex: 0,
+                                                     status: 'active' as const
+                                                 };
+                                                 
+                                                 setQuests(prev => [...prev, questWithNav]);
+                                                 setActiveQuest(questWithNav);
+                                                 setMode('quest');
+                                                 setQuestView('map');
+                                                 
+                                                 // Announce first step
+                                                 const firstStep = steps[0];
+                                                 result = {
+                                                     success: true,
+                                                     message: `Okay can! Navigate to ${place.name}. First step: ${firstStep.instruction}`,
+                                                     questDetails: {
+                                                         destination: place.name,
+                                                         distance: newQuest.distance,
+                                                         duration: newQuest.duration,
+                                                         reward: newQuest.reward,
+                                                         firstStep: firstStep.instruction
+                                                     }
+                                                 };
+                                             } else {
+                                                 // Fallback if directions fail
+                                                 const questWithoutNav = { ...newQuest, status: 'active' as const };
+                                                 setQuests(prev => [...prev, questWithoutNav]);
+                                                 setActiveQuest(questWithoutNav);
+                                                 setMode('quest');
+                                                 setQuestView('map');
+                                                 
+                                                 result = {
+                                                     success: true,
+                                                     message: `Quest created to ${place.name}! Distance: ${newQuest.distance} km. Follow the map lah!`,
+                                                     questDetails: {
+                                                         destination: place.name,
+                                                         distance: newQuest.distance,
+                                                         duration: newQuest.duration,
+                                                         reward: newQuest.reward
+                                                     }
+                                                 };
+                                             }
+                                         });
                                      } else {
                                          result = {
                                              success: false,
@@ -1301,6 +1366,9 @@ const AppContent = () => {
                              if (activeQuest) {
                                  const completedWaypoints = activeQuest.waypoints.filter(wp => wp.completed).length;
                                  const nextWaypoint = activeQuest.waypoints.find(wp => !wp.completed);
+                                 const currentNav = activeQuest.navigationSteps && activeQuest.currentStepIndex !== undefined
+                                     ? activeQuest.navigationSteps[activeQuest.currentStepIndex]
+                                     : null;
                                  
                                  result = {
                                      hasActiveQuest: true,
@@ -1308,6 +1376,7 @@ const AppContent = () => {
                                      destination: activeQuest.destination.name,
                                      progress: activeQuest.progress,
                                      completedCheckpoints: completedWaypoints,
+                                     currentNavigationStep: currentNav ? currentNav.instruction : 'Follow the map',
                                      totalCheckpoints: activeQuest.waypoints.length,
                                      nextCheckpoint: nextWaypoint ? nextWaypoint.name : "Final destination",
                                      distanceRemaining: activeQuest.distance * (1 - activeQuest.progress / 100),
@@ -1338,6 +1407,27 @@ const AppContent = () => {
                                  message: `Mood updated: ${mood}`,
                                  needsResponse: shouldRespond
                              };
+                         } else if (fc.name === 'getNextNavigationStep') {
+                             if (activeQuest && activeQuest.navigationSteps && activeQuest.currentStepIndex !== undefined) {
+                                 const currentStep = activeQuest.navigationSteps[activeQuest.currentStepIndex];
+                                 const stepsRemaining = activeQuest.navigationSteps.length - activeQuest.currentStepIndex - 1;
+                                 
+                                 result = {
+                                     success: true,
+                                     currentStep: currentStep.instruction,
+                                     distance: currentStep.distance,
+                                     duration: currentStep.duration,
+                                     stepNumber: activeQuest.currentStepIndex + 1,
+                                     totalSteps: activeQuest.navigationSteps.length,
+                                     stepsRemaining: stepsRemaining,
+                                     destination: activeQuest.destination.name
+                                 };
+                             } else {
+                                 result = {
+                                     success: false,
+                                     message: "No active navigation. Create a quest first lah!"
+                                 };
+                             }
                          }
                          
                          sessionPromise.then(session => {
@@ -1942,6 +2032,34 @@ const AppContent = () => {
   // Watch user location for quest progress and provide navigation updates
   useEffect(() => {
     if (!activeQuest || activeQuest.status !== 'active' || !location) return;
+
+    // Auto-advance navigation steps based on proximity
+    if (activeQuest.navigationSteps && activeQuest.currentStepIndex !== undefined) {
+      const totalSteps = activeQuest.navigationSteps.length;
+      const progressRatio = activeQuest.progress / 100;
+      const expectedStepIndex = Math.min(
+        Math.floor(progressRatio * totalSteps),
+        totalSteps - 1
+      );
+      
+      // Update to next step if user has progressed
+      if (expectedStepIndex > activeQuest.currentStepIndex && sessionRef.current && connected) {
+        const updatedQuest = { ...activeQuest, currentStepIndex: expectedStepIndex };
+        setActiveQuest(updatedQuest);
+        setQuests(prev => prev.map(q => q.id === updatedQuest.id ? updatedQuest : q));
+        
+        // Announce next step
+        const nextStep = activeQuest.navigationSteps[expectedStepIndex];
+        sessionRef.current.then((session: any) => {
+          session.sendRealtimeInput({
+            media: {
+              mimeType: 'text/plain',
+              data: btoa(`Next: ${nextStep.instruction}`)
+            }
+          });
+        });
+      }
+    }
 
     // Check proximity to waypoints
     activeQuest.waypoints.forEach(waypoint => {
@@ -2874,6 +2992,32 @@ const AppContent = () => {
                       {/* Active Quest Overlay */}
                       {activeQuest && (
                          <div className="absolute bottom-4 left-4 right-4 bg-slate-900/95 backdrop-blur-lg rounded-2xl p-4 border-2 border-teal-500 shadow-2xl">
+                            {/* Navigation Step */}
+                            {activeQuest.navigationSteps && activeQuest.currentStepIndex !== undefined && 
+                             activeQuest.currentStepIndex < activeQuest.navigationSteps.length && (
+                               <div className="mb-4 bg-gradient-to-r from-teal-600 to-blue-600 rounded-xl p-4">
+                                  <div className="flex items-start gap-3">
+                                     <Navigation className="w-8 h-8 text-white flex-shrink-0 animate-pulse" />
+                                     <div className="flex-1">
+                                        <p className="text-xs text-white/80 mb-1 font-semibold uppercase tracking-wider">
+                                           Step {activeQuest.currentStepIndex + 1} of {activeQuest.navigationSteps.length}
+                                        </p>
+                                        <p className="text-white font-bold text-lg leading-tight mb-2">
+                                           {activeQuest.navigationSteps[activeQuest.currentStepIndex].instruction}
+                                        </p>
+                                        <div className="flex gap-4 text-sm">
+                                           <span className="text-white/90">
+                                              📍 {activeQuest.navigationSteps[activeQuest.currentStepIndex].distance}
+                                           </span>
+                                           <span className="text-white/90">
+                                              ⏱️ {activeQuest.navigationSteps[activeQuest.currentStepIndex].duration}
+                                           </span>
+                                        </div>
+                                     </div>
+                                  </div>
+                               </div>
+                            )}
+                            
                             <div className="flex items-center justify-between mb-3">
                                <div className="flex-1">
                                   <h3 className="font-bold text-white text-lg">{activeQuest.title}</h3>
