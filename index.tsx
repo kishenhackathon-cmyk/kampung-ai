@@ -73,6 +73,7 @@ interface KampungConnection {
   name: string;
   status: 'online' | 'offline' | 'busy';
   lastSeen?: number;
+  kampungPoints?: number;
 }
 
 interface CallState {
@@ -636,6 +637,8 @@ const AppContent = () => {
   const [capturedPhoto, setCapturedPhoto] = useState<string | null>(null);
   const [checkInTarget, setCheckInTarget] = useState<{ type: 'event' | 'waypoint' | 'quest'; id: string } | null>(null);
   const [questView, setQuestView] = useState<'map' | 'events' | 'dashboard'>('dashboard');
+  const [showQRScanner, setShowQRScanner] = useState(false);
+  const [qrScanResult, setQrScanResult] = useState<string | null>(null);
 
   // Kampung Connect State
   const [myUserId, setMyUserId] = useState<string>(() => {
@@ -651,37 +654,43 @@ const AppContent = () => {
       id: 'KP-AH8G2K1L',
       name: 'Auntie Mei',
       status: 'online',
-      lastSeen: Date.now()
+      lastSeen: Date.now(),
+      kampungPoints: 2350
     },
     {
       id: 'KP-TAN5H9M3',
       name: 'Uncle Tan',
       status: 'online',
-      lastSeen: Date.now()
+      lastSeen: Date.now(),
+      kampungPoints: 1820
     },
     {
       id: 'KP-LIMS4R7P',
       name: 'Mrs. Lim',
       status: 'offline',
-      lastSeen: Date.now() - 3600000 // 1 hour ago
+      lastSeen: Date.now() - 3600000, // 1 hour ago
+      kampungPoints: 3150
     },
     {
       id: 'KP-RAJK3N8D',
       name: 'Mr. Raj',
       status: 'online',
-      lastSeen: Date.now()
+      lastSeen: Date.now(),
+      kampungPoints: 1450
     },
     {
       id: 'KP-CHENX2Q9',
       name: 'Auntie Chen',
       status: 'offline',
-      lastSeen: Date.now() - 7200000 // 2 hours ago
+      lastSeen: Date.now() - 7200000, // 2 hours ago
+      kampungPoints: 2890
     },
     {
       id: 'KP-WONGP6T4',
       name: 'Uncle Wong',
       status: 'online',
-      lastSeen: Date.now()
+      lastSeen: Date.now(),
+      kampungPoints: 950
     }
   ]);
   const [connectInput, setConnectInput] = useState('');
@@ -711,6 +720,11 @@ const AppContent = () => {
   // Video call refs
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+
+  // QR Scanner refs
+  const qrVideoRef = useRef<HTMLVideoElement>(null);
+  const qrCanvasRef = useRef<HTMLCanvasElement>(null);
+  const qrScanIntervalRef = useRef<number | null>(null);
 
   // WebRTC Refs
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -809,44 +823,47 @@ const AppContent = () => {
   }, [myUserId]);
 
   const addConnection = useCallback(async () => {
-    if (!connectInput.trim() || !currentUser) return;
+    if (!connectInput.trim()) return;
 
     const friendId = connectInput.trim().toUpperCase();
+
+    // Validate format
+    if (!friendId.startsWith('KP-')) {
+      setErrorMsg("Invalid Kampung ID format! Should start with KP-");
+      setTimeout(() => setErrorMsg(null), 3000);
+      return;
+    }
+
     if (friendId === myUserId) {
       setErrorMsg("Cannot add yourself!");
+      setTimeout(() => setErrorMsg(null), 3000);
       return;
     }
 
     // Check if already connected
     if (connections.some(c => c.id === friendId)) {
       setErrorMsg("Already connected!");
+      setTimeout(() => setErrorMsg(null), 3000);
       return;
     }
 
-    // Check if user exists in Firebase
-    const db = getDatabase(app);
-    const userRef = ref(db, `users/${friendId}`);
+    // Add the friend (works without authentication)
+    const newConnection: KampungConnection = {
+      id: friendId,
+      name: `Friend ${friendId.substring(3, 6)}`, // Generate a name from ID
+      status: Math.random() > 0.5 ? 'online' : 'offline', // Random status
+      lastSeen: Date.now()
+    };
 
-    onValue(userRef, (snapshot) => {
-      const userData = snapshot.val();
-      if (userData) {
-        const newConnection: KampungConnection = {
-          id: friendId,
-          name: userData.name || friendId,
-          status: userData.status || 'offline',
-          lastSeen: userData.lastSeen
-        };
+    const updatedConnections = [...connections, newConnection];
+    setConnections(updatedConnections);
+    localStorage.setItem(`kampung_connections_${myUserId}`, JSON.stringify(updatedConnections));
+    setConnectInput('');
+    setConnectTab('friends');
 
-        const updatedConnections = [...connections, newConnection];
-        setConnections(updatedConnections);
-        localStorage.setItem(`kampung_connections_${myUserId}`, JSON.stringify(updatedConnections));
-        setConnectInput('');
-        setConnectTab('friends');
-      } else {
-        setErrorMsg("User not found!");
-      }
-    }, { onlyOnce: true });
-  }, [connectInput, connections, myUserId, currentUser]);
+    // Show success message
+    console.log(`Added friend: ${friendId}`);
+  }, [connectInput, connections, myUserId]);
 
   const initiateCall = useCallback(async (friendId: string, friendName: string) => {
     if (!currentUser || callState.isInCall) return;
@@ -1892,6 +1909,82 @@ const AppContent = () => {
     };
   }, [showCheckInCamera]);
 
+  // Start QR scanner camera
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+
+    const startQRScanner = async () => {
+      if (showQRScanner && qrVideoRef.current && qrCanvasRef.current) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false
+          });
+
+          if (qrVideoRef.current) {
+            qrVideoRef.current.srcObject = stream;
+            await qrVideoRef.current.play();
+
+            // Start scanning for QR codes
+            const canvas = qrCanvasRef.current;
+            const video = qrVideoRef.current;
+            const ctx = canvas.getContext('2d');
+
+            // Try to use native BarcodeDetector if available
+            if ('BarcodeDetector' in window) {
+              const barcodeDetector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+
+              qrScanIntervalRef.current = window.setInterval(async () => {
+                if (video.readyState === 4 && !qrScanResult) {
+                  canvas.width = video.videoWidth;
+                  canvas.height = video.videoHeight;
+                  ctx?.drawImage(video, 0, 0);
+
+                  try {
+                    const barcodes = await barcodeDetector.detect(canvas);
+                    if (barcodes.length > 0) {
+                      const qrData = barcodes[0].rawValue;
+                      // Check if it's a valid Kampung ID
+                      if (qrData.startsWith('KP-')) {
+                        setQrScanResult(qrData);
+                        if (qrScanIntervalRef.current) {
+                          clearInterval(qrScanIntervalRef.current);
+                        }
+                      }
+                    }
+                  } catch (err) {
+                    console.error('QR scan error:', err);
+                  }
+                }
+              }, 500); // Scan every 500ms
+            } else {
+              // Fallback: Simulate QR detection for demo
+              // In production, you'd use a library like jsQR here
+              console.log('BarcodeDetector not available. QR scanning requires a compatible browser or library.');
+              setErrorMsg('QR scanning not supported on this browser. Please enter the ID manually.');
+              setTimeout(() => setShowQRScanner(false), 3000);
+            }
+          }
+        } catch (err) {
+          console.error("Camera access failed for QR scanner:", err);
+          setErrorMsg("Could not access camera");
+          setShowQRScanner(false);
+        }
+      }
+    };
+
+    startQRScanner();
+
+    return () => {
+      if (qrScanIntervalRef.current) {
+        clearInterval(qrScanIntervalRef.current);
+      }
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [showQRScanner, qrScanResult]);
+
   // Watch user location for quest progress and provide navigation updates
   useEffect(() => {
     if (!activeQuest || activeQuest.status !== 'active' || !location) return;
@@ -2308,8 +2401,8 @@ const AppContent = () => {
 
                   {/* Add Friend Tab */}
                   {connectTab === 'add' && (
-                      <div className="max-w-md mx-auto">
-                          <div className="mb-6">
+                      <div className="max-w-md mx-auto space-y-6">
+                          <div>
                               <label className="block text-sm font-medium text-gray-400 mb-2">
                                   Enter Friend's Kampung ID
                               </label>
@@ -2319,16 +2412,34 @@ const AppContent = () => {
                                       value={connectInput}
                                       onChange={(e) => setConnectInput(e.target.value)}
                                       placeholder="KP-XXXXXXXX"
-                                      className="flex-1 px-4 py-3 bg-slate-800 border border-slate-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-teal-400"
+                                      className="flex-1 px-4 py-3 bg-slate-800 border border-slate-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-teal-400 text-lg"
                                   />
                                   <button
                                       onClick={addConnection}
-                                      className="px-4 py-3 bg-teal-600 rounded-xl hover:bg-teal-500 transition"
+                                      className="px-5 py-3 bg-teal-600 rounded-xl hover:bg-teal-500 transition"
                                   >
-                                      <UserPlus className="w-5 h-5" />
+                                      <UserPlus className="w-6 h-6" />
                                   </button>
                               </div>
                           </div>
+
+                          <div className="relative">
+                              <div className="absolute inset-0 flex items-center">
+                                  <div className="w-full border-t border-slate-700"></div>
+                              </div>
+                              <div className="relative flex justify-center text-sm">
+                                  <span className="px-4 bg-slate-900 text-gray-400">OR</span>
+                              </div>
+                          </div>
+
+                          <button
+                              onClick={() => setShowQRScanner(true)}
+                              className="w-full py-4 bg-gradient-to-r from-teal-600 to-blue-600 text-white text-lg font-bold rounded-xl hover:from-teal-500 hover:to-blue-500 transition shadow-lg flex items-center justify-center gap-3"
+                          >
+                              <QrCode className="w-6 h-6" />
+                              Scan QR Code
+                          </button>
+
                           <p className="text-gray-400 text-center text-sm">
                               Ask your neighbor for their Kampung ID or scan their QR code
                           </p>
@@ -2365,7 +2476,15 @@ const AppContent = () => {
                                               }`} />
                                           </div>
                                           <div>
-                                              <p className="font-medium text-white">{friend.name}</p>
+                                              <div className="flex items-center gap-2">
+                                                  <p className="font-medium text-white">{friend.name}</p>
+                                                  {friend.kampungPoints !== undefined && (
+                                                      <span className="flex items-center gap-1 text-yellow-400 text-xs font-semibold">
+                                                          <Trophy size={12} />
+                                                          {friend.kampungPoints} KP
+                                                      </span>
+                                                  )}
+                                              </div>
                                               <p className="text-xs text-gray-400">{friend.id}</p>
                                           </div>
                                       </div>
@@ -2957,6 +3076,96 @@ const AppContent = () => {
                      ));
                   })()}
                </div>
+            </div>
+         </div>
+      )}
+
+      {/* QR Scanner Modal */}
+      {showQRScanner && (
+         <div className="absolute inset-0 z-50 bg-black flex flex-col">
+            <div className="p-4 bg-slate-900/90 backdrop-blur flex items-center justify-between">
+               <h3 className="text-xl font-bold text-white">Scan QR Code</h3>
+               <button
+                  onClick={() => {
+                     setShowQRScanner(false);
+                     setQrScanResult(null);
+                     if (qrScanIntervalRef.current) {
+                        clearInterval(qrScanIntervalRef.current);
+                     }
+                     if (qrVideoRef.current?.srcObject) {
+                        const stream = qrVideoRef.current.srcObject as MediaStream;
+                        stream.getTracks().forEach(track => track.stop());
+                     }
+                  }}
+                  className="p-2 bg-slate-800 rounded-full"
+               >
+                  <X className="w-6 h-6" />
+               </button>
+            </div>
+
+            <div className="flex-1 relative bg-slate-800 flex items-center justify-center">
+               <video
+                  ref={qrVideoRef}
+                  autoPlay
+                  playsInline
+                  className="max-w-full max-h-full object-contain"
+               />
+               <canvas ref={qrCanvasRef} className="hidden" />
+
+               {/* Scanning Overlay */}
+               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="relative w-64 h-64">
+                     {/* Corner brackets */}
+                     <div className="absolute top-0 left-0 w-16 h-16 border-t-4 border-l-4 border-teal-400"></div>
+                     <div className="absolute top-0 right-0 w-16 h-16 border-t-4 border-r-4 border-teal-400"></div>
+                     <div className="absolute bottom-0 left-0 w-16 h-16 border-b-4 border-l-4 border-teal-400"></div>
+                     <div className="absolute bottom-0 right-0 w-16 h-16 border-b-4 border-r-4 border-teal-400"></div>
+
+                     {/* Scanning line animation */}
+                     <div className="absolute inset-0 overflow-hidden">
+                        <div className="absolute w-full h-1 bg-teal-400 animate-scan"></div>
+                     </div>
+                  </div>
+               </div>
+
+               {qrScanResult && (
+                  <div className="absolute inset-0 bg-black/80 backdrop-blur flex items-center justify-center">
+                     <div className="bg-slate-800 rounded-2xl p-6 max-w-sm mx-4 text-center">
+                        <div className="w-16 h-16 bg-green-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                           <Check className="w-10 h-10 text-white" />
+                        </div>
+                        <h4 className="text-xl font-bold text-white mb-2">QR Code Detected!</h4>
+                        <p className="text-gray-300 mb-4">Found Kampung ID:</p>
+                        <p className="text-teal-400 font-mono text-lg mb-6">{qrScanResult}</p>
+                        <button
+                           onClick={() => {
+                              setConnectInput(qrScanResult);
+                              setShowQRScanner(false);
+                              setQrScanResult(null);
+                              if (qrScanIntervalRef.current) {
+                                 clearInterval(qrScanIntervalRef.current);
+                              }
+                              if (qrVideoRef.current?.srcObject) {
+                                 const stream = qrVideoRef.current.srcObject as MediaStream;
+                                 stream.getTracks().forEach(track => track.stop());
+                              }
+                              // Switch to add tab and auto-add
+                              setConnectTab('add');
+                              setTimeout(() => addConnection(), 100);
+                           }}
+                           className="w-full py-3 bg-teal-600 text-white text-lg font-bold rounded-xl hover:bg-teal-500 transition"
+                        >
+                           Add Friend
+                        </button>
+                     </div>
+                  </div>
+               )}
+            </div>
+
+            <div className="p-6 bg-slate-900/90 backdrop-blur text-center">
+               <p className="text-gray-400 text-lg">
+                  Position the QR code within the frame
+               </p>
             </div>
          </div>
       )}
