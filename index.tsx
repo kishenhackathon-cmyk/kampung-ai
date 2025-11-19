@@ -131,7 +131,8 @@ const App = () => {
           systemInstruction: SYSTEM_INSTRUCTION,
           responseModalities: [Modality.AUDIO],
           speechConfig: {
-             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
+             languageCode: 'en-SG'
           },
           tools: [{
             functionDeclarations: [
