@@ -3,10 +3,13 @@ import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { 
   Mic, MicOff, Video, VideoOff, PhoneOff, MapPin, 
-  AlertTriangle, Menu, X, QrCode, Activity, Pause
+  AlertTriangle, Menu, X, QrCode, Activity, Pause, Globe
 } from 'lucide-react';
 
 // --- Configuration & Types ---
+
+// Capture API Key safely at module level for use in both GenAI and Maps
+const API_KEY = process.env.API_KEY;
 
 const SYSTEM_INSTRUCTION = `
 You are 'Ketua Kampung' (Village Head), a wise, friendly, and protective AI assistant for a Singaporean/Malaysian community.
@@ -19,10 +22,12 @@ You are currently in a VOICE and VIDEO call with a villager.
 **Your Core Responsibilities:**
 1. **Voice Interaction**: Keep responses concise, conversational, and warm. Do not read long lists.
 2. **Language**: Speak fluently in English (Singlish), Malay, Mandarin, or Tamil based on what you hear. 
-3. **Visual Monitor (Mood Analysis)**: If you receive video frames, constantly analyze the user's facial expression.
-   - If they look happy/neutral: Be friendly ("Wah, you look spirit good today!").
-   - **CRITICAL**: If they look Scared, Crying, or Distressed, immediately change your tone to be calming and concern: "Aiyo, why you look like that? Got problem? Don't worry, tell me."
-4. **Quest & Connect**: Guide them to events or help them check phone numbers for scams if asked.
+3. **Visual Monitor (Mood Analysis - CRITICAL)**: 
+   - You will receive a snapshot of the user every 5 seconds. 
+   - **ACTIVELY CHECK** their facial expression in every snapshot.
+   - If they look **Happy/Neutral**: You can carry on normally.
+   - If they look **Sad, Crying, Scared, or Distressed**: **INTERRUPT** and ask immediately: "Eh, aiyo, why you look like that? You okay? Tell Uncle/Auntie."
+4. **Quest & Connect**: Guide them to events or help them check phone numbers for scams if asked. You can also show them the 3D map of the kampung.
 
 **Tools**:
 - Use 'searchNearbyEvents' if they ask about activities ("Got what happenings?").
@@ -67,9 +72,135 @@ function createSilentStream(ctx: AudioContext) {
     return dst.stream;
 }
 
+async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate = 24000,
+  numChannels = 1
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      // Convert Int16 to Float32
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
+
+// --- 3D Map Component ---
+
+declare global {
+  interface Window {
+    google: any;
+  }
+  namespace JSX {
+    interface IntrinsicElements {
+      'gmp-map-3d': any;
+      'gmp-map-3d-marker': any;
+    }
+  }
+}
+
+const GoogleMap3D = ({ events, userLocation, onClose }: { events: typeof MOCK_EVENTS, userLocation: {lat: number, lng: number} | null, onClose: () => void }) => {
+    const mapRef = useRef<any>(null);
+    const [loaded, setLoaded] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        const initMap = async () => {
+            try {
+                if (!window.google?.maps?.importLibrary) {
+                    const script = document.createElement('script');
+                    // Note: 'v=alpha' is currently required for 3D Maps
+                    // Use the module-level API_KEY constant
+                    script.src = `https://maps.googleapis.com/maps/api/js?key=${API_KEY}&v=alpha&libraries=maps3d`;
+                    script.async = true;
+                    script.onerror = () => setError("Failed to load Google Maps script.");
+                    document.head.appendChild(script);
+                    await new Promise((resolve, reject) => {
+                        script.onload = resolve;
+                        script.onerror = reject;
+                    });
+                }
+                
+                // Initialize library
+                await window.google.maps.importLibrary("maps3d");
+                setLoaded(true);
+            } catch (err) {
+                console.error("Maps Load Error:", err);
+                setError("Failed to initialize 3D Map.");
+            }
+        };
+
+        initMap();
+    }, []);
+
+    const centerLat = userLocation?.lat || 1.3521;
+    const centerLng = userLocation?.lng || 103.8198;
+
+    if (error) {
+        return (
+             <div className="absolute inset-0 z-40 bg-slate-900 flex flex-col items-center justify-center animate-fade-in p-4 text-center">
+                 <AlertTriangle className="w-12 h-12 text-red-500 mb-4" />
+                 <p className="text-white font-bold">{error}</p>
+                 <button onClick={onClose} className="mt-4 px-4 py-2 bg-slate-700 rounded text-white">Close</button>
+             </div>
+        );
+    }
+
+    return (
+        <div className="absolute inset-0 z-40 bg-slate-900 flex flex-col animate-fade-in">
+             <div className="absolute top-4 left-4 z-50 bg-slate-900/80 backdrop-blur p-2 rounded-lg text-white">
+                 <h3 className="font-bold text-sm text-teal-400">Kampung 3D View</h3>
+             </div>
+             <button 
+                onClick={onClose} 
+                className="absolute top-4 right-4 z-50 p-2 bg-black/50 text-white rounded-full hover:bg-black/80 transition"
+             >
+                 <X className="w-6 h-6" />
+             </button>
+
+             {loaded ? (
+                 <gmp-map-3d 
+                    ref={mapRef}
+                    center={`${centerLat},${centerLng}`}
+                    tilt="67.5"
+                    range="1000"
+                    heading="0"
+                    style={{ width: '100%', height: '100%' }}
+                 >
+                     {events.map(evt => (
+                         <gmp-map-3d-marker 
+                            key={evt.id} 
+                            position={`${evt.lat},${evt.lng}`} 
+                            label={evt.name}
+                         />
+                     ))}
+                      {userLocation && (
+                         <gmp-map-3d-marker 
+                            position={`${userLocation.lat},${userLocation.lng}`} 
+                            label="YOU"
+                         />
+                     )}
+                 </gmp-map-3d>
+             ) : (
+                 <div className="flex-1 flex items-center justify-center text-teal-400 animate-pulse">
+                     Loading 3D Map...
+                 </div>
+             )}
+        </div>
+    );
+};
+
 // --- App Component ---
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Initialize GenAI with the same key
+const ai = new GoogleGenAI({ apiKey: API_KEY });
 
 const App = () => {
   // State
@@ -81,6 +212,7 @@ const App = () => {
   const [location, setLocation] = useState<{lat: number, lng: number} | null>(null);
   const [volumeLevel, setVolumeLevel] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [showMap3D, setShowMap3D] = useState(false);
 
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -271,311 +403,260 @@ const App = () => {
 
   const stopSession = () => {
      if (sessionRef.current) {
-         sessionRef.current.then((s: any) => s.close && s.close()); 
+         sessionRef.current.then((s: any) => s.close()); // Close Gemini session
      }
-     if (audioContextRef.current) audioContextRef.current.close();
-     if (inputSourceRef.current) inputSourceRef.current.disconnect();
-     if (processorRef.current) processorRef.current.disconnect();
-     if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-     
+     if (audioContextRef.current) {
+         audioContextRef.current.close();
+     }
+     if (frameIntervalRef.current) {
+         clearInterval(frameIntervalRef.current);
+     }
      setConnected(false);
      setVolumeLevel(0);
-     setIsCamOn(false);
   };
 
-  // --- Video Streaming Logic ---
+  // --- Video Loop (Mood Analysis) ---
 
   useEffect(() => {
-    let stream: MediaStream | null = null;
-
-    if (connected && isCamOn) {
-        // Use flexible constraints for better mobile support
-        const constraints = { 
-            video: { facingMode: 'user' }, // Prefer front camera
-            audio: false 
-        };
-
-        navigator.mediaDevices.getUserMedia(constraints).then(s => {
-            stream = s;
-            if (videoRef.current) {
-                videoRef.current.srcObject = stream;
-                videoRef.current.play().catch(e => console.log("Video play error", e));
-            }
-            
-            // Capture frames
-            frameIntervalRef.current = window.setInterval(() => {
-                if (!canvasRef.current || !videoRef.current || !sessionRef.current) return;
-                
-                // Draw frame to hidden canvas
-                const ctx = canvasRef.current.getContext('2d');
-                if (videoRef.current.videoWidth > 0) {
-                    canvasRef.current.width = videoRef.current.videoWidth;
-                    canvasRef.current.height = videoRef.current.videoHeight;
-                    ctx?.drawImage(videoRef.current, 0, 0);
-                    
-                    const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.5).split(',')[1];
-                    
-                    sessionRef.current.then((session: any) => {
-                        session.sendRealtimeInput({
-                            media: { mimeType: 'image/jpeg', data: base64Data }
-                        });
-                    });
-                }
-            }, 1000); // 1 FPS for analysis is sufficient
-        }).catch(e => {
-            console.warn("Camera access failed", e);
-            setIsCamOn(false);
-            setErrorMsg("Could not access camera");
-        });
-    } else {
-        // Cleanup if camera turned off
-        if (videoRef.current) {
-            videoRef.current.srcObject = null;
+    if (!connected || !isCamOn || !sessionRef.current) {
+        if (frameIntervalRef.current) {
+             clearInterval(frameIntervalRef.current);
+             frameIntervalRef.current = null;
         }
+        return;
     }
 
+    // Send frame every 5 seconds
+    const intervalId = window.setInterval(() => {
+         if (videoRef.current && canvasRef.current) {
+             const canvas = canvasRef.current;
+             const video = videoRef.current;
+             
+             // Check if video is actually ready
+             if (video.videoWidth === 0) return;
+
+             canvas.width = video.videoWidth;
+             canvas.height = video.videoHeight;
+             const ctx = canvas.getContext('2d');
+             if (ctx) {
+                 ctx.drawImage(video, 0, 0);
+                 const base64Image = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+                 
+                 sessionRef.current.then((session: any) => {
+                     console.log("Sending video frame for mood analysis...");
+                     session.sendRealtimeInput({
+                         media: {
+                             mimeType: 'image/jpeg',
+                             data: base64Image
+                         }
+                     });
+                 });
+             }
+         }
+    }, 5000);
+
+    frameIntervalRef.current = intervalId;
+
     return () => {
-        if (stream) stream.getTracks().forEach(t => t.stop());
         if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
     };
   }, [connected, isCamOn]);
 
-  // --- Helpers ---
 
-  async function decodeAudioData(data: Uint8Array, ctx: AudioContext) {
-     const int16 = new Int16Array(data.buffer);
-     const buffer = ctx.createBuffer(1, int16.length, 24000);
-     const channel = buffer.getChannelData(0);
-     for(let i=0; i<int16.length; i++) {
-         channel[i] = int16[i] / 32768.0;
-     }
-     return buffer;
-  }
+  // --- Render Helpers ---
 
-  // --- UI Renders ---
+  const renderDrawer = () => (
+    <div className={`fixed inset-y-0 right-0 w-80 bg-slate-900 shadow-2xl transform transition-transform z-50 ${showDrawer ? 'translate-x-0' : 'translate-x-full'}`}>
+       <div className="p-4">
+         <div className="flex justify-between items-center mb-6">
+            <h2 className="text-xl font-bold text-teal-400">Kampung Tools</h2>
+            <button onClick={() => setShowDrawer(false)}><X className="text-white" /></button>
+         </div>
+         
+         <div className="space-y-4">
+            <button 
+                onClick={() => { setMode('quest'); setShowDrawer(false); }}
+                className="w-full p-4 bg-slate-800 rounded-xl flex items-center gap-3 hover:bg-slate-700 transition"
+            >
+                <MapPin className="text-yellow-400" />
+                <div className="text-left">
+                    <div className="font-bold text-white">Kampung Quest</div>
+                    <div className="text-xs text-slate-400">Find events & earn points</div>
+                </div>
+            </button>
 
-  const toggleMic = () => setIsMicOn(!isMicOn);
-  const toggleCam = () => setIsCamOn(!isCamOn);
+            <button 
+                onClick={() => { setMode('connect'); setShowDrawer(false); }}
+                className="w-full p-4 bg-slate-800 rounded-xl flex items-center gap-3 hover:bg-slate-700 transition"
+            >
+                <QrCode className="text-blue-400" />
+                <div className="text-left">
+                    <div className="font-bold text-white">Kampung Connect</div>
+                    <div className="text-xs text-slate-400">Add friends & verify numbers</div>
+                </div>
+            </button>
+
+            <button 
+                onClick={() => { setMode('distress'); setShowDrawer(false); }}
+                className="w-full p-4 bg-red-900/30 border border-red-500/50 rounded-xl flex items-center gap-3 hover:bg-red-900/50 transition"
+            >
+                <AlertTriangle className="text-red-500" />
+                <div className="text-left">
+                    <div className="font-bold text-red-400">SOS Distress</div>
+                    <div className="text-xs text-red-300/70">Emergency help & monitoring</div>
+                </div>
+            </button>
+         </div>
+       </div>
+    </div>
+  );
 
   return (
-    <div className="flex flex-col h-screen bg-slate-900 text-white overflow-hidden relative font-sans">
-      
-      <canvas ref={canvasRef} className="hidden" />
-
+    <div className="min-h-screen bg-slate-950 text-white font-sans overflow-hidden flex flex-col">
       {/* Header */}
-      <header className="absolute top-0 left-0 right-0 p-4 flex justify-between items-center z-20">
-         <div className="flex items-center gap-3">
-            <button onClick={() => setShowDrawer(true)} className="p-2 bg-black/20 rounded-full backdrop-blur-md hover:bg-black/40 transition">
-                <Menu className="w-6 h-6" />
-            </button>
-            <div>
-                <h1 className="font-bold text-lg tracking-tight">Kampung AI</h1>
-                <p className="text-xs opacity-60 flex items-center gap-1">
-                    <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-                    {connected ? 'Live Active' : 'Offline'}
-                </p>
-            </div>
-         </div>
-         {mode === 'distress' && (
-             <div className="bg-red-600 px-3 py-1 rounded-full animate-pulse font-bold text-xs shadow-lg shadow-red-900/50">SOS MODE</div>
-         )}
+      <header className="p-4 flex justify-between items-center z-10 bg-gradient-to-b from-slate-900 to-transparent">
+        <div className="flex items-center gap-2">
+            <div className="w-8 h-8 bg-teal-500 rounded-full flex items-center justify-center font-bold text-slate-900">K</div>
+            <span className="font-bold text-lg tracking-wide">Kampung AI</span>
+        </div>
+        <button onClick={() => setShowDrawer(true)} className="p-2 bg-slate-800 rounded-full">
+            <Menu className="w-6 h-6" />
+        </button>
       </header>
 
       {/* Main Content Area */}
-      <div className="flex-1 flex flex-col items-center justify-center relative">
-         
-         {/* Error Message Toast */}
-         {errorMsg && (
-             <div className="absolute top-20 bg-red-500/90 text-white px-4 py-2 rounded-full text-sm font-medium animate-bounce z-30">
-                 {errorMsg}
-             </div>
-         )}
+      <main className="flex-1 flex flex-col items-center justify-center relative">
+        
+        {/* 3D Map Overlay */}
+        {showMap3D && (
+             <GoogleMap3D 
+                events={MOCK_EVENTS} 
+                userLocation={location} 
+                onClose={() => setShowMap3D(false)} 
+             />
+        )}
 
-         {/* The AI Circle / Camera Container */}
-         <div className="relative z-10 flex flex-col items-center gap-8">
-             <div 
-                className={`rounded-full flex items-center justify-center transition-all duration-200 ease-out relative overflow-hidden border-4 bg-black
-                    ${connected ? 'border-teal-400/30 shadow-[0_0_60px_rgba(45,212,191,0.4)]' : 'border-gray-700 bg-gray-800'}
-                `}
-                style={{
-                    width: connected ? `${160 + (volumeLevel * 1.2)}px` : '160px',
-                    height: connected ? `${160 + (volumeLevel * 1.2)}px` : '160px',
-                }}
+        {/* Central AI Circle */}
+        <div className="relative w-64 h-64 flex items-center justify-center">
+            {/* Pulsing Ring (Voice Activity) */}
+            <div 
+                className={`absolute inset-0 rounded-full bg-teal-500/20 blur-xl transition-all duration-100`}
+                style={{ transform: `scale(${1 + volumeLevel / 50})` }}
+            />
+            
+            {/* Main Circle Container */}
+            <div className="w-full h-full rounded-full bg-slate-900 border-4 border-slate-800 overflow-hidden relative shadow-2xl z-10 flex items-center justify-center">
+                
+                {/* Camera Feed Layer */}
+                {isCamOn ? (
+                    <video 
+                        ref={videoRef}
+                        autoPlay 
+                        playsInline
+                        muted
+                        onLoadedMetadata={(e) => e.currentTarget.play()}
+                        className="w-full h-full object-cover transform scale-x-[-1]" // Mirror effect
+                    />
+                ) : (
+                    // Default AI Avatar State
+                    <div className="flex flex-col items-center animate-pulse">
+                        <div className="w-20 h-20 bg-teal-500 rounded-full blur-2xl opacity-50 absolute" />
+                        <Activity className="w-16 h-16 text-teal-400 relative z-10" />
+                    </div>
+                )}
+                
+                {/* Listening Indicator Overlay */}
+                {connected && !isMicOn && (
+                    <div className="absolute inset-0 bg-black/60 flex items-center justify-center backdrop-blur-sm">
+                        <span className="font-bold text-red-400 flex items-center gap-2">
+                            <Pause className="w-4 h-4" /> PAUSED
+                        </span>
+                    </div>
+                )}
+            </div>
+
+            {/* Hidden Canvas for Frame Capture */}
+            <canvas ref={canvasRef} className="hidden" />
+        </div>
+
+        {/* Status Text */}
+        <div className="mt-8 text-center space-y-2 h-20">
+             {connected ? (
+                 <>
+                    <p className="text-teal-400 font-medium animate-pulse">
+                        {isCamOn ? "Watching & Listening..." : "Listening..."}
+                    </p>
+                    {isCamOn && <p className="text-xs text-slate-500">Mood Analysis Active (Every 5s)</p>}
+                 </>
+             ) : (
+                 <p className="text-slate-500">Tap the mic to start speaking with Ketua Kampung</p>
+             )}
+             {errorMsg && <p className="text-red-400 text-sm">{errorMsg}</p>}
+        </div>
+
+        {/* Quest/Map Trigger (Quick Action) */}
+        {mode === 'quest' && !showMap3D && (
+            <div className="absolute bottom-32 bg-slate-800 p-4 rounded-xl w-11/12 max-w-md animate-slide-up">
+                <div className="flex justify-between items-center mb-2">
+                    <h3 className="font-bold text-yellow-400">Nearby Events</h3>
+                    <button onClick={() => setShowMap3D(true)} className="text-xs bg-teal-600 px-3 py-1 rounded-full flex items-center gap-1">
+                        <Globe className="w-3 h-3" /> View 3D Map
+                    </button>
+                </div>
+                {MOCK_EVENTS.map(e => (
+                    <div key={e.id} className="flex justify-between text-sm border-b border-slate-700 py-2 last:border-0">
+                        <span>{e.name}</span>
+                        <span className="text-teal-300">{e.reward}</span>
+                    </div>
+                ))}
+            </div>
+        )}
+
+      </main>
+
+      {/* Control Bar */}
+      <div className="p-6 flex justify-center gap-6 bg-slate-900/50 backdrop-blur-lg safe-pb z-20">
+        
+        {/* Camera Toggle */}
+        <button 
+            onClick={() => setIsCamOn(!isCamOn)}
+            className={`p-4 rounded-full transition ${isCamOn ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400'}`}
+        >
+            {isCamOn ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
+        </button>
+
+        {/* Main Mic/Connect Button */}
+        {connected ? (
+             <button 
+                onClick={() => setIsMicOn(!isMicOn)} // Toggle Mute logic
+                className={`p-6 rounded-full shadow-lg shadow-teal-500/20 transition transform active:scale-95 ${isMicOn ? 'bg-teal-500 text-slate-900' : 'bg-red-500 text-white'}`}
              >
-                 {/* 1. Video Layer (Only if Cam ON) */}
-                 {/* Using standard video tag attributes to ensure autoplay on mobile */}
-                 <video 
-                    ref={videoRef} 
-                    autoPlay 
-                    playsInline 
-                    muted 
-                    className={`absolute inset-0 w-full h-full object-cover transform -scale-x-100 transition-opacity duration-500 ${connected && isCamOn ? 'opacity-100' : 'opacity-0'}`}
-                 />
+                 {isMicOn ? <Mic className="w-8 h-8" /> : <MicOff className="w-8 h-8" />}
+             </button>
+        ) : (
+             <button 
+                onClick={startSession}
+                className="p-6 bg-teal-600 text-white rounded-full shadow-lg shadow-teal-500/30 animate-bounce-slow"
+             >
+                 <Mic className="w-8 h-8" />
+             </button>
+        )}
 
-                 {/* 2. Gradient Layer (Fallback if Cam OFF or Loading) */}
-                 <div className={`absolute inset-0 bg-gradient-to-br from-teal-400 to-blue-600 transition-opacity duration-500 ${connected && !isCamOn ? 'opacity-100' : 'opacity-0'}`} />
-
-                 {/* 3. Content/Icon Layer */}
-                 <div className="z-20 relative flex items-center justify-center w-full h-full pointer-events-none">
-                     {!connected ? (
-                         <div className="flex flex-col items-center text-center pointer-events-auto cursor-pointer" onClick={startSession}>
-                            <p className="font-bold text-xl tracking-wider">CONNECT</p>
-                         </div>
-                     ) : (
-                        // Hide icon if Camera is ON so user sees themselves clearly
-                        !isCamOn && !isMicOn ? (
-                            <MicOff className="w-12 h-12 text-white/50" /> 
-                        ) : (
-                           !isCamOn && <Activity className={`w-12 h-12 text-white opacity-80 ${volumeLevel > 10 ? 'animate-pulse' : ''}`} />
-                        )
-                     )}
-                 </div>
-             </div>
-
-             <div className="text-center h-8 flex flex-col gap-1 items-center">
-                 {connected ? (
-                     <>
-                        <p className="text-sm font-medium opacity-80 animate-fade-in flex items-center gap-2 justify-center">
-                            {isCamOn && <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"/>}
-                            {isCamOn ? "Reading expressions..." : (
-                                isMicOn 
-                                    ? (volumeLevel > 10 ? "Ketua Listening..." : "Ketua Kampung ready.") 
-                                    : "LISTENING PAUSED"
-                            )}
-                        </p>
-                        {!isMicOn && <p className="text-xs text-teal-400 font-medium">Tap Mic to Resume</p>}
-                     </>
-                 ) : (
-                     <p className="text-xs text-gray-500">Tap CONNECT to start</p>
-                 )}
-             </div>
-         </div>
-
+        {/* End Call Button */}
+        {connected && (
+            <button 
+                onClick={stopSession}
+                className="p-4 bg-red-600 text-white rounded-full hover:bg-red-700 transition"
+            >
+                <PhoneOff className="w-6 h-6" />
+            </button>
+        )}
       </div>
 
-      {/* Bottom Controls */}
-      <div className="p-8 pb-12 flex justify-center items-center gap-6 z-20 relative">
-          {connected && (
-              <>
-                {/* Mic / Stop Listening Button */}
-                <button 
-                    onClick={toggleMic} 
-                    className={`p-4 rounded-full transition-all duration-200 flex flex-col items-center justify-center gap-1 ${isMicOn ? 'bg-gray-800 text-white hover:bg-gray-700' : 'bg-red-500/20 text-red-400 border border-red-500'}`}
-                    title={isMicOn ? "Stop Listening" : "Resume Listening"}
-                >
-                    {isMicOn ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
-                </button>
-
-                {/* End Call Button */}
-                <button 
-                    onClick={stopSession} 
-                    className="p-6 bg-red-600 hover:bg-red-700 rounded-full shadow-lg transform hover:scale-105 transition-all border-4 border-slate-900"
-                    title="End Session"
-                >
-                    <PhoneOff className="w-8 h-8 fill-current" />
-                </button>
-
-                {/* Camera Toggle */}
-                <button 
-                    onClick={toggleCam} 
-                    className={`p-4 rounded-full transition-colors ${isCamOn ? 'bg-white text-black hover:bg-gray-200' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
-                    title="Toggle Mood Camera"
-                >
-                    {isCamOn ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
-                </button>
-              </>
-          )}
-      </div>
-
-      {/* Drawer */}
-      {showDrawer && (
-          <div className="absolute inset-0 bg-black/80 z-50 backdrop-blur-sm transition-opacity" onClick={() => setShowDrawer(false)}>
-              <div className="absolute left-0 top-0 bottom-0 w-72 bg-slate-900 border-r border-slate-800 p-6 flex flex-col gap-6 animate-slide-right" onClick={(e) => e.stopPropagation()}>
-                  <div className="flex items-center justify-between mb-4">
-                      <h2 className="font-bold text-xl text-teal-400">Kampung Hub</h2>
-                      <button onClick={() => setShowDrawer(false)}><X className="w-6 h-6 text-gray-500" /></button>
-                  </div>
-
-                  <div className="space-y-2">
-                      <button className="w-full text-left p-4 rounded-xl bg-teal-900/30 text-teal-400 border border-teal-900/50 flex items-center gap-3">
-                          <Activity className="w-5 h-5" />
-                          <div>
-                            <span className="block font-medium">Voice Mode</span>
-                            <span className="text-xs opacity-70">Talk to Ketua</span>
-                          </div>
-                      </button>
-                      <button onClick={() => {setMode('quest'); setShowDrawer(false)}} className="w-full text-left p-4 rounded-xl hover:bg-slate-800 text-gray-300 flex items-center gap-3 transition-colors">
-                          <MapPin className="w-5 h-5" />
-                          <div>
-                             <span className="block font-medium">Kampung Quest</span>
-                             <span className="text-xs opacity-50">Find events nearby</span>
-                          </div>
-                      </button>
-                      <button onClick={() => {setMode('connect'); setShowDrawer(false)}} className="w-full text-left p-4 rounded-xl hover:bg-slate-800 text-gray-300 flex items-center gap-3 transition-colors">
-                          <QrCode className="w-5 h-5" />
-                           <div>
-                             <span className="block font-medium">Kampung Connect</span>
-                             <span className="text-xs opacity-50">Share ID</span>
-                          </div>
-                      </button>
-                  </div>
-
-                  <div className="mt-auto pt-6 border-t border-slate-800">
-                      <button 
-                        onClick={() => { setMode('distress'); setShowDrawer(false); }} 
-                        className="w-full p-4 rounded-xl bg-red-900/50 text-red-400 border border-red-900 flex items-center justify-center gap-2 font-bold hover:bg-red-900/80 transition shadow-lg shadow-red-900/20"
-                      >
-                          <AlertTriangle className="w-5 h-5" />
-                          SOS ALERT
-                      </button>
-                  </div>
-              </div>
-          </div>
-      )}
-
-      {/* Overlays for other modes */}
-      {mode === 'connect' && (
-          <div className="absolute inset-0 z-30 bg-slate-900/95 flex flex-col items-center justify-center p-6 animate-fade-in">
-              <button onClick={() => setMode('voice')} className="absolute top-4 right-4 p-2 bg-slate-800 rounded-full"><X className="w-6 h-6"/></button>
-              <div className="bg-white p-8 rounded-3xl shadow-2xl">
-                  <QrCode className="w-48 h-48 text-black" />
-                  <p className="text-black text-center mt-4 font-mono text-lg tracking-widest">USR-8888</p>
-              </div>
-              <p className="mt-8 text-gray-400 text-center">Let your neighbor scan this<br/>to connect instantly.</p>
-          </div>
-      )}
-
-      {mode === 'quest' && (
-          <div className="absolute inset-0 z-30 bg-slate-900/95 flex flex-col p-6 animate-fade-in">
-             <div className="flex justify-between items-center mb-6">
-                <h2 className="text-2xl font-bold text-teal-400">Quests Nearby</h2>
-                <button onClick={() => setMode('voice')} className="p-2 bg-slate-800 rounded-full"><X/></button>
-             </div>
-             <div className="space-y-4 overflow-y-auto pb-20">
-                 {MOCK_EVENTS.map(evt => (
-                     <div key={evt.id} className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex justify-between items-center">
-                         <div>
-                             <h3 className="font-bold">{evt.name}</h3>
-                             <p className="text-sm text-gray-400">{evt.time} • {evt.reward}</p>
-                         </div>
-                         <button className="px-4 py-2 bg-teal-600 text-xs font-bold rounded-lg hover:bg-teal-500">GO</button>
-                     </div>
-                 ))}
-                 <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 opacity-50">
-                     <h3 className="font-bold">Community Watch</h3>
-                     <p className="text-sm text-gray-400">Locked • Lvl 2 Required</p>
-                 </div>
-             </div>
-          </div>
-      )}
-
+      {renderDrawer()}
     </div>
   );
 };
 
-const rootElement = document.getElementById('root');
-if (!rootElement) {
-    throw new Error("Root element not found");
-}
-const root = createRoot(rootElement);
+const root = createRoot(document.getElementById('root')!);
 root.render(<App />);
