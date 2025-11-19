@@ -783,58 +783,36 @@ const AppContent = () => {
 
   const startSession = async () => {
     try {
-      console.log('[DEBUG] Starting Gemini Live session...');
       setErrorMsg(null);
-
-      // Check API key before proceeding
-      if (!GEMINI_API_KEY) {
-        throw new Error("API key is missing! Check your .env file");
-      }
-
+      
       // 1. Init Audio Context
-      console.log('[DEBUG] Initializing Audio Context...');
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioContextClass) throw new Error("AudioContext not supported");
-
+      
       audioContextRef.current = new AudioContextClass();
       const ctx = audioContextRef.current;
-      console.log('[DEBUG] Audio Context created, state:', ctx.state);
-
+      
       // Vital: Resume context to ensure it's active (required by some browsers)
       if (ctx.state === 'suspended') {
-        console.log('[DEBUG] Resuming suspended Audio Context...');
         await ctx.resume();
       }
 
-      const sampleRate = ctx.sampleRate;
-      console.log('[DEBUG] Audio sample rate:', sampleRate, 'Hz'); 
+      const sampleRate = ctx.sampleRate; 
 
       // 2. Get Media Stream (Mic)
       let stream: MediaStream;
-      console.log('[DEBUG] Requesting microphone access...');
       try {
-          stream = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                  echoCancellation: true,
-                  noiseSuppression: true,
-                  sampleRate: sampleRate
-              }
-          });
-          console.log('[DEBUG] Microphone access granted');
-          console.log('[DEBUG] Audio tracks:', stream.getAudioTracks().length);
-      } catch (e: any) {
-          console.error('[ERROR] Microphone access failed:', e.name, e.message);
-          console.warn("Falling back to silent stream.");
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+          console.warn("Microphone not found or denied. Falling back to silent stream.", e);
           stream = createSilentStream(ctx);
-          setIsMicOn(false);
-          setErrorMsg(`Mic error: ${e.name} - Audio Input Disabled`);
+          setIsMicOn(false); 
+          setErrorMsg("Mic denied/missing - Audio Input Disabled");
       }
-
+      
       setConnected(true);
 
       // 3. Connect to Gemini Live
-      console.log('[DEBUG] Connecting to Gemini Live API...');
-      console.log('[DEBUG] Model: gemini-2.0-flash-exp');
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
@@ -858,162 +836,63 @@ const AppContent = () => {
                   properties: { phoneNumber: { type: Type.STRING } },
                   required: ["phoneNumber"]
                 }
-              },
-              {
-                name: "createQuestToDestination",
-                description: "Create a quest to navigate user to a destination.",
-                parameters: {
-                  type: Type.OBJECT,
-                  properties: {
-                    destination: { type: Type.STRING, description: "The destination name or place" }
-                  },
-                  required: ["destination"]
-                }
-              },
-              {
-                name: "getActiveQuestStatus",
-                description: "Get the status of the current active quest.",
-                parameters: { type: Type.OBJECT, properties: {} }
               }
             ]
           }]
         },
         callbacks: {
             onopen: () => {
-                console.log('[SUCCESS] Gemini Live Connected!');
-                console.log('[DEBUG] Session opened successfully at:', new Date().toISOString());
-                console.log('[DEBUG] Setting up audio pipeline...');
-
+                console.log("Gemini Live Connected");
+                
                 const source = ctx.createMediaStreamSource(stream);
                 inputSourceRef.current = source;
-                console.log('[DEBUG] Media stream source created');
                 
                 const processor = ctx.createScriptProcessor(4096, 1, 1);
                 processorRef.current = processor;
 
-                let audioChunkCount = 0;
-                const TARGET_SAMPLE_RATE = 16000; // Gemini expects 16kHz
-
                 processor.onaudioprocess = (e) => {
-                    if (!isMicOn) return;
-
+                    if (!isMicOn) return; 
+                    
                     const inputData = e.inputBuffer.getChannelData(0);
-
-                    // Calculate volume for visualization
+                    
                     let sum = 0;
                     for(let i=0; i<inputData.length; i++) sum += inputData[i]*inputData[i];
                     const rms = Math.sqrt(sum/inputData.length);
-                    setVolumeLevel(Math.min(rms * 1000, 100));
+                    setVolumeLevel(Math.min(rms * 1000, 100)); 
 
-                    // Resample from native rate (48kHz) to 16kHz for Gemini
-                    const resampleRatio = sampleRate / TARGET_SAMPLE_RATE;
-                    const resampledLength = Math.floor(inputData.length / resampleRatio);
-                    const resampledData = new Float32Array(resampledLength);
-
-                    for (let i = 0; i < resampledLength; i++) {
-                        const srcIndex = Math.floor(i * resampleRatio);
-                        resampledData[i] = inputData[srcIndex];
-                    }
-
-                    // Convert to PCM16
-                    const pcm16 = new Int16Array(resampledLength);
-                    for (let i = 0; i < resampledLength; i++) {
-                        let s = Math.max(-1, Math.min(1, resampledData[i]));
+                    const pcm16 = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        let s = Math.max(-1, Math.min(1, inputData[i]));
                         pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                     }
-
+                    
                     const base64Audio = arrayBufferToBase64(pcm16.buffer);
-
-                    // Log first few audio chunks for debugging
-                    audioChunkCount++;
-                    if (audioChunkCount <= 5) {
-                        console.log(`[DEBUG] Sending audio chunk #${audioChunkCount}, size: ${base64Audio.length} chars, resampled to: ${TARGET_SAMPLE_RATE}Hz`);
-                    }
-
-                    // Only send audio if we're still connected and have a session
-                    if (connected && sessionRef.current) {
-                        // Use the stored session directly instead of the promise
-                        const currentSession = sessionRef.current;
-                        if (currentSession && typeof currentSession.sendRealtimeInput === 'function') {
-                            try {
-                                currentSession.sendRealtimeInput({
-                                    media: {
-                                        mimeType: `audio/pcm;rate=${TARGET_SAMPLE_RATE}`,
-                                        data: base64Audio
-                                    }
-                                });
-
-                                // Log successful send for first few chunks
-                                if (audioChunkCount <= 3) {
-                                    console.log(`[DEBUG] Successfully sent audio chunk #${audioChunkCount}`);
-                                }
-                            } catch (error: any) {
-                                if (audioChunkCount <= 5) {
-                                    console.error('[ERROR] Failed to send audio chunk:', error?.message || error);
-                                }
-                            }
-                        } else if (audioChunkCount <= 3) {
-                            console.warn('[WARN] Session not ready yet for audio chunk', audioChunkCount);
-                        }
-                    }
+                    
+                    sessionPromise.then(session => {
+                         session.sendRealtimeInput({
+                             media: {
+                                 mimeType: `audio/pcm;rate=${sampleRate}`,
+                                 data: base64Audio
+                             }
+                         });
+                    });
                 };
 
                 source.connect(processor);
                 processor.connect(ctx.destination);
             },
             onmessage: async (msg) => {
-                console.log('[DEBUG] Message received from Gemini:', {
-                    hasServerContent: !!msg.serverContent,
-                    hasModelTurn: !!msg.serverContent?.modelTurn,
-                    hasToolCall: !!msg.toolCall,
-                    messageType: Object.keys(msg)[0]
-                });
-
-                // Check for text responses (mood analysis)
-                const textData = msg.serverContent?.modelTurn?.parts?.find(part => part.text)?.text;
-                if (textData) {
-                    console.log('[DEBUG] Text response received:', textData);
-
-                    // Extract mood/emotion keywords from the text
-                    const moodKeywords = ['happy', 'sad', 'angry', 'neutral', 'focused', 'calm',
-                                         'worried', 'excited', 'tired', 'stressed', 'relaxed',
-                                         'confused', 'confident', 'anxious', 'content'];
-
-                    // Look for mood descriptions in the text
-                    let detectedMood = 'Analyzing...';
-                    const lowerText = textData.toLowerCase();
-
-                    for (const mood of moodKeywords) {
-                        if (lowerText.includes(mood)) {
-                            detectedMood = mood.charAt(0).toUpperCase() + mood.slice(1);
-                            break;
-                        }
-                    }
-
-                    // Also check for phrases like "you look..." or "expression shows..."
-                    if (lowerText.includes('you look')) {
-                        const lookMatch = lowerText.match(/you look\s+(\w+)/);
-                        if (lookMatch) {
-                            detectedMood = lookMatch[1].charAt(0).toUpperCase() + lookMatch[1].slice(1);
-                        }
-                    }
-
-                    setCurrentMood(detectedMood);
-                }
-
-                const audioPart = msg.serverContent?.modelTurn?.parts?.find(part => part.inlineData?.data);
-                const audioData = audioPart?.inlineData?.data;
+                const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
                 if (audioData) {
-                    console.log('[DEBUG] Audio data received, length:', audioData.length);
                     const audioBytes = base64ToUint8Array(audioData);
                     const audioBuffer = await decodeAudioData(audioBytes, ctx);
-
-                    setVolumeLevel(50 + (Math.random() * 50));
+                    
+                    setVolumeLevel(50 + (Math.random() * 50)); 
 
                     const source = ctx.createBufferSource();
                     source.buffer = audioBuffer;
                     source.connect(ctx.destination);
-
+                    
                     const now = ctx.currentTime;
                     const startTime = Math.max(now, nextStartTimeRef.current);
                     source.start(startTime);
@@ -1030,139 +909,36 @@ const AppContent = () => {
                              const num = args.phoneNumber || "";
                              const isScam = MOCK_SCAM_NUMBERS.some(n => num.includes(n));
                              result = { isSuspicious: isScam, message: isScam ? "DANGER: Scam detected." : "Seems safe." };
-                         } else if (fc.name === 'createQuestToDestination') {
-                             const args: any = fc.args;
-                             const destinationName = args.destination || "";
-
-                             // Switch to quest mode
-                             setMode('quest');
-
-                             // Search for the destination using Google Places
-                             if (window.google && location) {
-                                 // Create a temporary div for the PlacesService
-                                 const service = new google.maps.places.PlacesService(document.createElement('div'));
-
-                                 const request = {
-                                     query: destinationName,
-                                     location: new google.maps.LatLng(location.lat, location.lng),
-                                     radius: 5000, // 5km radius
-                                 };
-
-                                 service.textSearch(request, (results, status) => {
-                                     if (status === google.maps.places.PlacesServiceStatus.OK && results && results[0]) {
-                                         const place = results[0];
-                                         handleSelectDestination(place);
-
-                                         // Auto-start the quest after a short delay
-                                         setTimeout(() => {
-                                             const quest = quests[quests.length - 1];
-                                             if (quest) {
-                                                 startQuest(quest.id);
-                                             }
-                                         }, 1000);
-                                     }
-                                 });
-
-                                 result = {
-                                     success: true,
-                                     message: `Okay! Creating quest to ${destinationName}. I guide you there!`
-                                 };
-                             } else {
-                                 result = {
-                                     success: false,
-                                     message: "Cannot create quest yet. Make sure location is enabled!"
-                                 };
-                             }
-                         } else if (fc.name === 'getActiveQuestStatus') {
-                             if (activeQuest) {
-                                 const remainingWaypoints = activeQuest.waypoints.filter(wp => !wp.completed).length;
-                                 const nextWaypoint = activeQuest.waypoints.find(wp => !wp.completed);
-
-                                 result = {
-                                     hasActiveQuest: true,
-                                     quest: {
-                                         title: activeQuest.title,
-                                         progress: Math.round(activeQuest.progress),
-                                         distance: activeQuest.distance,
-                                         remainingWaypoints,
-                                         nextWaypoint: nextWaypoint ? nextWaypoint.name : "destination",
-                                         reward: activeQuest.reward,
-                                         destination: activeQuest.destination.name
-                                     },
-                                     message: `You are ${Math.round(activeQuest.progress)}% done. ${remainingWaypoints > 0 ? `Next checkpoint: ${nextWaypoint?.name}` : 'Almost there!'}`
-                                 };
-                             } else {
-                                 result = {
-                                     hasActiveQuest: false,
-                                     message: "No active quest. Tell me where you want to go!"
-                                 };
-                             }
                          }
-
-                         // Send tool response using the stored session
-                         if (sessionRef.current && typeof sessionRef.current.sendToolResponse === 'function') {
-                             try {
-                                 sessionRef.current.sendToolResponse({
-                                     functionResponses: {
-                                         id: fc.id,
-                                         name: fc.name,
-                                         response: { result }
-                                     }
-                                 });
-                                 console.log('[DEBUG] Tool response sent for:', fc.name);
-                             } catch (error: any) {
-                                 console.error('[ERROR] Failed to send tool response:', error?.message || error);
-                             }
-                         } else {
-                             console.warn('[WARN] Session not ready to send tool response');
-                         }
+                         
+                         sessionPromise.then(session => {
+                             session.sendToolResponse({
+                                 functionResponses: {
+                                     id: fc.id,
+                                     name: fc.name,
+                                     response: { result }
+                                 }
+                             });
+                         });
                     }
                 }
             },
-            onclose: (event?: any) => {
-                console.log('[INFO] Session closed', event);
+            onclose: () => {
+                console.log("Session closed");
                 setConnected(false);
-                setErrorMsg("Session closed");
             },
-            onerror: (err: any) => {
-                console.error('[ERROR] Gemini Live session error:', err);
-                console.error('[ERROR] Error details:', {
-                    message: err?.message,
-                    code: err?.code,
-                    name: err?.name,
-                    stack: err?.stack
-                });
+            onerror: (err) => {
+                console.error("Session error", err);
                 setConnected(false);
-                const errorMsg = err?.message || err?.code || "Connection Error";
-                setErrorMsg(`API Error: ${errorMsg}`);
+                setErrorMsg("Connection Error");
             }
         }
       });
-
-      // Wait for session and log status
-      sessionPromise.then((session) => {
-          console.log('[DEBUG] Session promise resolved - ready to send audio');
-          console.log('[DEBUG] Session object:', {
-              hasSession: !!session,
-              hasSendRealtimeInput: typeof session?.sendRealtimeInput === 'function',
-              hasSendToolResponse: typeof session?.sendToolResponse === 'function',
-              hasClose: typeof session?.close === 'function'
-          });
-          sessionRef.current = session;  // Store the actual session, not the promise
-      }).catch((err) => {
-          console.error('[ERROR] Session promise rejected:', err);
-          console.error('[ERROR] Full error object:', JSON.stringify(err, null, 2));
-          setErrorMsg(`Failed to connect: ${err?.message || err}`);
-          setConnected(false);
-      });
+      
+      sessionRef.current = sessionPromise;
 
     } catch (e: any) {
-      console.error('[ERROR] Failed to start session:', e);
-      console.error('[ERROR] Error details:', {
-          name: e.name,
-          message: e.message,
-          stack: e.stack
-      });
+      console.error("Failed to start session", e);
       setErrorMsg(e.message || "Failed to start");
       setConnected(false);
     }
@@ -1297,12 +1073,43 @@ const AppContent = () => {
   // --- Helpers ---
 
   async function decodeAudioData(data: Uint8Array, ctx: AudioContext) {
-     const int16 = new Int16Array(data.buffer);
-     const buffer = ctx.createBuffer(1, int16.length, 24000);
-     const channel = buffer.getChannelData(0);
-     for(let i=0; i<int16.length; i++) {
-         channel[i] = int16[i] / 32768.0;
+     console.log('[DECODE] Input data length:', data.length, 'bytes');
+
+     // Check if data length is even (required for Int16 conversion)
+     if (data.length % 2 !== 0) {
+         console.warn('[DECODE WARNING] Odd number of bytes, trimming last byte');
+         data = data.slice(0, data.length - 1);
      }
+
+     const int16 = new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
+     console.log('[DECODE] Int16 samples:', int16.length);
+     console.log('[DECODE] First 10 Int16 values:', Array.from(int16.slice(0, 10)));
+
+     // Gemini returns 24kHz audio
+     const sampleRate = 24000;
+     const buffer = ctx.createBuffer(1, int16.length, sampleRate);
+     const channel = buffer.getChannelData(0);
+
+     // Check for audio content
+     let maxSample = 0;
+     let minSample = 0;
+
+     for(let i = 0; i < int16.length; i++) {
+         const normalized = int16[i] / 32768.0;
+         channel[i] = normalized;
+         if (normalized > maxSample) maxSample = normalized;
+         if (normalized < minSample) minSample = normalized;
+     }
+
+     console.log('[DECODE] Audio stats:');
+     console.log('[DECODE] - Sample rate:', sampleRate, 'Hz');
+     console.log('[DECODE] - Duration:', buffer.duration, 'seconds');
+     console.log('[DECODE] - Sample range:', minSample, 'to', maxSample);
+
+     if (maxSample === 0 && minSample === 0) {
+         console.error('[DECODE ERROR] All samples are zero - no audio content!');
+     }
+
      return buffer;
   }
 
@@ -1594,13 +1401,14 @@ const AppContent = () => {
                 </button>
 
                 {/* Camera Toggle */}
-                <button 
-                    onClick={toggleCam} 
+                <button
+                    onClick={toggleCam}
                     className={`p-4 rounded-full transition-colors ${isCamOn ? 'bg-white text-black hover:bg-gray-200' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
                     title="Toggle Mood Camera"
                 >
                     {isCamOn ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
                 </button>
+
               </>
           )}
       </div>
