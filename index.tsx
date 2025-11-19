@@ -834,7 +834,7 @@ const AppContent = () => {
 
       // 3. Connect to Gemini Live
       console.log('[DEBUG] Connecting to Gemini Live API...');
-      console.log('[DEBUG] Model: gemini-2.5-flash-native-audio-preview-09-2025');
+      console.log('[DEBUG] Model: gemini-2.0-flash-exp');
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
@@ -881,6 +881,7 @@ const AppContent = () => {
         callbacks: {
             onopen: () => {
                 console.log('[SUCCESS] Gemini Live Connected!');
+                console.log('[DEBUG] Session opened successfully at:', new Date().toISOString());
                 console.log('[DEBUG] Setting up audio pipeline...');
 
                 const source = ctx.createMediaStreamSource(stream);
@@ -891,6 +892,8 @@ const AppContent = () => {
                 processorRef.current = processor;
 
                 let audioChunkCount = 0;
+                const TARGET_SAMPLE_RATE = 16000; // Gemini expects 16kHz
+
                 processor.onaudioprocess = (e) => {
                     if (!isMicOn) return;
 
@@ -902,9 +905,20 @@ const AppContent = () => {
                     const rms = Math.sqrt(sum/inputData.length);
                     setVolumeLevel(Math.min(rms * 1000, 100));
 
-                    const pcm16 = new Int16Array(inputData.length);
-                    for (let i = 0; i < inputData.length; i++) {
-                        let s = Math.max(-1, Math.min(1, inputData[i]));
+                    // Resample from native rate (48kHz) to 16kHz for Gemini
+                    const resampleRatio = sampleRate / TARGET_SAMPLE_RATE;
+                    const resampledLength = Math.floor(inputData.length / resampleRatio);
+                    const resampledData = new Float32Array(resampledLength);
+
+                    for (let i = 0; i < resampledLength; i++) {
+                        const srcIndex = Math.floor(i * resampleRatio);
+                        resampledData[i] = inputData[srcIndex];
+                    }
+
+                    // Convert to PCM16
+                    const pcm16 = new Int16Array(resampledLength);
+                    for (let i = 0; i < resampledLength; i++) {
+                        let s = Math.max(-1, Math.min(1, resampledData[i]));
                         pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                     }
 
@@ -913,33 +927,34 @@ const AppContent = () => {
                     // Log first few audio chunks for debugging
                     audioChunkCount++;
                     if (audioChunkCount <= 5) {
-                        console.log(`[DEBUG] Sending audio chunk #${audioChunkCount}, size: ${base64Audio.length} chars, sample rate: ${sampleRate}`);
+                        console.log(`[DEBUG] Sending audio chunk #${audioChunkCount}, size: ${base64Audio.length} chars, resampled to: ${TARGET_SAMPLE_RATE}Hz`);
                     }
 
-                    // Only send audio if we're still connected
-                    if (connected) {
-                        sessionPromise.then(session => {
-                            // Double-check session is valid before sending
-                            if (session && typeof session.sendRealtimeInput === 'function') {
-                                try {
-                                    session.sendRealtimeInput({
-                                        media: {
-                                            mimeType: `audio/pcm;rate=${sampleRate}`,
-                                            data: base64Audio
-                                        }
-                                    });
-                                } catch (error) {
-                                    // Silently ignore if connection is closed
-                                    if (audioChunkCount <= 5) {
-                                        console.warn('[WARN] Could not send audio chunk, connection may be closed');
+                    // Only send audio if we're still connected and have a session
+                    if (connected && sessionRef.current) {
+                        // Use the stored session directly instead of the promise
+                        const currentSession = sessionRef.current;
+                        if (currentSession && typeof currentSession.sendRealtimeInput === 'function') {
+                            try {
+                                currentSession.sendRealtimeInput({
+                                    media: {
+                                        mimeType: `audio/pcm;rate=${TARGET_SAMPLE_RATE}`,
+                                        data: base64Audio
                                     }
+                                });
+
+                                // Log successful send for first few chunks
+                                if (audioChunkCount <= 3) {
+                                    console.log(`[DEBUG] Successfully sent audio chunk #${audioChunkCount}`);
+                                }
+                            } catch (error: any) {
+                                if (audioChunkCount <= 5) {
+                                    console.error('[ERROR] Failed to send audio chunk:', error?.message || error);
                                 }
                             }
-                        }).catch(err => {
-                            if (audioChunkCount <= 5 && connected) {
-                                console.error('[ERROR] Failed to send audio chunk:', err);
-                            }
-                        });
+                        } else if (audioChunkCount <= 3) {
+                            console.warn('[WARN] Session not ready yet for audio chunk', audioChunkCount);
+                        }
                     }
                 };
 
@@ -1084,15 +1099,23 @@ const AppContent = () => {
                              }
                          }
 
-                         sessionPromise.then(session => {
-                             session.sendToolResponse({
-                                 functionResponses: {
-                                     id: fc.id,
-                                     name: fc.name,
-                                     response: { result }
-                                 }
-                             });
-                         });
+                         // Send tool response using the stored session
+                         if (sessionRef.current && typeof sessionRef.current.sendToolResponse === 'function') {
+                             try {
+                                 sessionRef.current.sendToolResponse({
+                                     functionResponses: {
+                                         id: fc.id,
+                                         name: fc.name,
+                                         response: { result }
+                                     }
+                                 });
+                                 console.log('[DEBUG] Tool response sent for:', fc.name);
+                             } catch (error: any) {
+                                 console.error('[ERROR] Failed to send tool response:', error?.message || error);
+                             }
+                         } else {
+                             console.warn('[WARN] Session not ready to send tool response');
+                         }
                     }
                 }
             },
@@ -1115,14 +1138,22 @@ const AppContent = () => {
             }
         }
       });
-      
-      sessionRef.current = sessionPromise;
 
-      // Log first audio chunk sent
-      sessionPromise.then(() => {
+      // Wait for session and log status
+      sessionPromise.then((session) => {
           console.log('[DEBUG] Session promise resolved - ready to send audio');
+          console.log('[DEBUG] Session object:', {
+              hasSession: !!session,
+              hasSendRealtimeInput: typeof session?.sendRealtimeInput === 'function',
+              hasSendToolResponse: typeof session?.sendToolResponse === 'function',
+              hasClose: typeof session?.close === 'function'
+          });
+          sessionRef.current = session;  // Store the actual session, not the promise
       }).catch((err) => {
           console.error('[ERROR] Session promise rejected:', err);
+          console.error('[ERROR] Full error object:', JSON.stringify(err, null, 2));
+          setErrorMsg(`Failed to connect: ${err?.message || err}`);
+          setConnected(false);
       });
 
     } catch (e: any) {
@@ -1138,14 +1169,22 @@ const AppContent = () => {
   };
 
   const stopSession = () => {
-     if (sessionRef.current) {
-         sessionRef.current.then((s: any) => s.close && s.close()); 
+     // Close the session if it exists
+     if (sessionRef.current && typeof sessionRef.current.close === 'function') {
+         try {
+             sessionRef.current.close();
+             console.log('[DEBUG] Session closed successfully');
+         } catch (error) {
+             console.error('[ERROR] Failed to close session:', error);
+         }
      }
+
      if (audioContextRef.current) audioContextRef.current.close();
      if (inputSourceRef.current) inputSourceRef.current.disconnect();
      if (processorRef.current) processorRef.current.disconnect();
      if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-     
+
+     sessionRef.current = null;  // Clear the session reference
      setConnected(false);
      setVolumeLevel(0);
      setIsCamOn(false);
@@ -1192,21 +1231,16 @@ const AppContent = () => {
                         
                         const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.5).split(',')[1];
                         
-                        // Only send video frames if still connected
-                        if (connected) {
-                            sessionRef.current.then((session: any) => {
-                                if (session && typeof session.sendRealtimeInput === 'function') {
-                                    try {
-                                        session.sendRealtimeInput({
-                                            media: { mimeType: 'image/jpeg', data: base64Data }
-                                        });
-                                    } catch (error) {
-                                        console.warn('[WARN] Could not send video frame, connection may be closed');
-                                    }
-                                }
-                            }).catch(err => {
-                                // Silently ignore if connection is closed
-                            });
+                        // Only send video frames if still connected and have a session
+                        if (connected && sessionRef.current && typeof sessionRef.current.sendRealtimeInput === 'function') {
+                            try {
+                                sessionRef.current.sendRealtimeInput({
+                                    media: { mimeType: 'image/jpeg', data: base64Data }
+                                });
+                                console.log('[DEBUG] Video frame sent successfully');
+                            } catch (error) {
+                                console.warn('[WARN] Could not send video frame:', error);
+                            }
                         }
                     }
                 }, 1000); 
@@ -1245,7 +1279,7 @@ const AppContent = () => {
     }
   };
 
-  // Auth disabled for testing - uncomment below to enable
+  // Authentication disabled - uncomment below to enable
   // if (loading) {
   //   return (
   //     <div className="min-h-screen bg-slate-900 flex items-center justify-center">
