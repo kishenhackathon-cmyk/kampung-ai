@@ -1583,38 +1583,44 @@ const AppContent = () => {
                     await videoRef.current.play().catch(e => console.error("Video auto-play failed", e));
                 }
 
-                // Start frame capture - send frames every 5 seconds for mood analysis
-                frameIntervalRef.current = window.setInterval(async () => {
-                    if (!canvasRef.current || !videoRef.current || !sessionRef.current) return;
+                // DELAY: Wait 10 seconds before starting mood analysis to prioritize audio connection
+                console.log('[VIDEO] Camera started. Waiting 10 seconds before starting mood analysis...');
+                setTimeout(() => {
+                    console.log('[VIDEO] Starting mood analysis frame capture');
                     
-                    const ctx = canvasRef.current.getContext('2d');
-                    if (videoRef.current.readyState === 4 && videoRef.current.videoWidth > 0) {
-                        canvasRef.current.width = videoRef.current.videoWidth;
-                        canvasRef.current.height = videoRef.current.videoHeight;
-                        ctx?.drawImage(videoRef.current, 0, 0);
+                    // Start frame capture - send frames every 5 seconds for mood analysis
+                    frameIntervalRef.current = window.setInterval(async () => {
+                        if (!canvasRef.current || !videoRef.current || !sessionRef.current) return;
                         
-                        const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.6).split(',')[1];
-                        
-                        // Only send video frames if still connected and have a session
-                    if (connected && sessionRef.current) {
-                        try {
-                            // Await the session promise if needed
-                            const session = await sessionRef.current;
+                        const ctx = canvasRef.current.getContext('2d');
+                        if (videoRef.current.readyState === 4 && videoRef.current.videoWidth > 0) {
+                            canvasRef.current.width = videoRef.current.videoWidth;
+                            canvasRef.current.height = videoRef.current.videoHeight;
+                            ctx?.drawImage(videoRef.current, 0, 0);
                             
-                            if (session && typeof session.sendRealtimeInput === 'function') {
-                                // Send only the image frame - the system instruction will handle the analysis
-                                session.sendRealtimeInput({
-                                    media: { mimeType: 'image/jpeg', data: base64Data }
-                                });
+                            const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.6).split(',')[1];
+                            
+                            // Only send video frames if still connected and have a session
+                        if (connected && sessionRef.current) {
+                            try {
+                                // Await the session promise if needed
+                                const session = await sessionRef.current;
                                 
-                                console.log('[DEBUG] Video frame sent to Gemini for mood analysis');
+                                if (session && typeof session.sendRealtimeInput === 'function') {
+                                    // Send only the image frame - the system instruction will handle the analysis
+                                    session.sendRealtimeInput({
+                                        media: { mimeType: 'image/jpeg', data: base64Data }
+                                    });
+                                    
+                                    console.log('[DEBUG] Video frame sent to Gemini for mood analysis');
+                                }
+                            } catch (error) {
+                                console.error('[ERROR] Could not send video frame:', error);
                             }
-                        } catch (error) {
-                            console.error('[ERROR] Could not send video frame:', error);
                         }
                     }
-                }
-            }, 5000); // Send every 5 seconds 
+                }, 5000); // Send every 5 seconds
+                }, 10000); // Wait 10 seconds before starting mood analysis 
 
         } catch (e) {
                 console.error("Camera access completely failed", e);
