@@ -101,6 +101,8 @@ const SYSTEM_INSTRUCTION = `
 You are 'Ketua Kampung' (Village Head), a wise, friendly, and protective AI assistant for a Singaporean/Malaysian community.
 You are currently in a VOICE and VIDEO call with a villager.
 
+CRITICAL: You MUST respond with AUDIO to all voice inputs from the user. Always generate audio responses when the user speaks to you.
+
 Persona & Tone:
 - Accent/Style: Speak with a warm, distinct Singaporean/Malaysian flair (Singlish). Use local particles naturally (like "lah", "mah", "can", "lor", "abuden", "aiyo") but maintain your authority as the Head.
 - Vibe: You are like a helpful, experienced uncle/auntie looking out for the neighborhood. Be efficient ("Can, can!") but caring. 
@@ -108,7 +110,7 @@ Persona & Tone:
 - If male voice is detected, change tone to male and address yourself as uncle 
 
 Your Core Responsibilities:
-1. Voice Interaction: Keep responses concise, conversational, and warm. Do not read long lists.
+1. Voice Interaction: Keep responses concise, conversational, and warm. Do not read long lists. ALWAYS respond with audio when user speaks.
 2. Language: Speak fluently in English (Singlish), Malay, Mandarin (Singapore - informal), Hokkien (Singapore), Cantonese (singapore) or Tamil based on what you hear.  
 Respond in the language that you hear 
 
@@ -119,8 +121,9 @@ Respond in the language that you hear
    - Provide confidence level (0-100)
    - Set shouldRespond to false for normal moods (happy, calm, neutral, tired, confused)
    - Set shouldRespond to true ONLY for concerning moods (distressed, scared, crying, anxious)
-   - After calling analyzeMood: If shouldRespond is false, DO NOT generate any audio or text response - stay silent
-   - Only if shouldRespond is true, then speak with concern: "Aiyo, you look worried lah. Got problem? Tell uncle/auntie."
+   - IMPORTANT: After calling analyzeMood with shouldRespond=false, SILENTLY end your turn - no audio response
+   - Only if shouldRespond is true, generate audio: "Aiyo, you look worried lah. Got problem? Tell uncle/auntie."
+   - NOTE: If you receive audio input from user, ALWAYS respond with audio even if analyzing mood simultaneously
 4. Quest & Navigation: PROACTIVELY help users navigate with step-by-step directions
    - IMPORTANT: When user mentions wanting to go somewhere, IMMEDIATELY create a quest
    - Listen for: "I want to go to", "bring me to", "where is", "how to get to", "navigate to"
@@ -1097,10 +1100,27 @@ const AppContent = () => {
       audioContextRef.current = new AudioContextClass();
       const ctx = audioContextRef.current;
       
+      console.log('[AUDIO CONTEXT] Initial state:', ctx.state, 'Sample rate:', ctx.sampleRate);
+      
       // Vital: Resume context to ensure it's active (required by some browsers)
       if (ctx.state === 'suspended') {
+        console.log('[AUDIO CONTEXT] Context suspended, attempting to resume...');
         await ctx.resume();
+        console.log('[AUDIO CONTEXT] Context resumed, new state:', ctx.state);
       }
+      
+      // Monitor audio context state changes
+      ctx.onstatechange = () => {
+        console.log('[AUDIO CONTEXT] State changed to:', ctx.state);
+        if (ctx.state === 'suspended') {
+          console.warn('[AUDIO CONTEXT] Context suspended! Attempting to resume...');
+          ctx.resume().then(() => {
+            console.log('[AUDIO CONTEXT] Context resumed successfully');
+          }).catch(err => {
+            console.error('[AUDIO CONTEXT] Failed to resume:', err);
+          });
+        }
+      };
 
       const sampleRate = ctx.sampleRate; 
 
@@ -1237,21 +1257,70 @@ const AppContent = () => {
                 processor.connect(ctx.destination);
             },
             onmessage: async (msg) => {
-                const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                console.log('[MESSAGE] Received message from Gemini:', JSON.stringify(msg, null, 2));
+                
+                // Check multiple possible locations for audio data
+                let audioData = null;
+                
+                // Location 1: serverContent.modelTurn.parts[0].inlineData.data
+                if (msg.serverContent?.modelTurn?.parts) {
+                    for (const part of msg.serverContent.modelTurn.parts) {
+                        if (part.inlineData?.mimeType?.startsWith('audio/') && part.inlineData?.data) {
+                            audioData = part.inlineData.data;
+                            console.log('[AUDIO] Found audio in serverContent.modelTurn.parts');
+                            break;
+                        }
+                    }
+                }
+                
+                // Location 2: serverContent.turnComplete (sometimes audio is here)
+                if (!audioData && msg.serverContent?.turnComplete) {
+                    console.log('[MESSAGE] Turn complete, checking for buffered audio');
+                }
+                
                 if (audioData) {
-                    const audioBytes = base64ToUint8Array(audioData);
-                    const audioBuffer = await decodeAudioData(audioBytes, ctx);
+                    console.log('[AUDIO] Received audio data, length:', audioData.length);
                     
-                    setVolumeLevel(50 + (Math.random() * 50)); 
+                    // Check audio context state
+                    if (ctx.state === 'suspended') {
+                        console.warn('[AUDIO] AudioContext is SUSPENDED! Attempting to resume...');
+                        await ctx.resume();
+                        console.log('[AUDIO] AudioContext resumed, state:', ctx.state);
+                    }
+                    
+                    try {
+                        const audioBytes = base64ToUint8Array(audioData);
+                        console.log('[AUDIO] Decoded to bytes:', audioBytes.length);
+                        
+                        const audioBuffer = await decodeAudioData(audioBytes, ctx);
+                        console.log('[AUDIO] Audio buffer created:', {
+                            duration: audioBuffer.duration,
+                            sampleRate: audioBuffer.sampleRate,
+                            numberOfChannels: audioBuffer.numberOfChannels,
+                            length: audioBuffer.length
+                        });
+                        
+                        setVolumeLevel(50 + (Math.random() * 50)); 
 
-                    const source = ctx.createBufferSource();
-                    source.buffer = audioBuffer;
-                    source.connect(ctx.destination);
-                    
-                    const now = ctx.currentTime;
-                    const startTime = Math.max(now, nextStartTimeRef.current);
-                    source.start(startTime);
-                    nextStartTimeRef.current = startTime + audioBuffer.duration;
+                        const source = ctx.createBufferSource();
+                        source.buffer = audioBuffer;
+                        source.connect(ctx.destination);
+                        
+                        const now = ctx.currentTime;
+                        const startTime = Math.max(now, nextStartTimeRef.current);
+                        console.log('[AUDIO] Playing audio at time:', startTime, 'current time:', now);
+                        source.start(startTime);
+                        nextStartTimeRef.current = startTime + audioBuffer.duration;
+                        console.log('[AUDIO] Audio playback started successfully');
+                    } catch (error) {
+                        console.error('[AUDIO ERROR] Failed to play audio:', error);
+                    }
+                } else {
+                    // Only log "no audio" if this wasn't a silent mood update or tool call
+                    if (!msg.toolCall && !msg.serverContent?.interrupted) {
+                        console.log('[MESSAGE] No audio data in message. Message type:', msg.serverContent ? Object.keys(msg.serverContent) : 'no serverContent');
+                        console.log('[DEBUG] Full message structure:', JSON.stringify(msg, null, 2));
+                    }
                 }
 
                 if (msg.toolCall) {
@@ -1545,7 +1614,7 @@ const AppContent = () => {
                         }
                     }
                 }
-            }, 2000); // Send every 2 seconds 
+            }, 5000); // Send every 5 seconds 
 
         } catch (e) {
                 console.error("Camera access completely failed", e);
@@ -2111,6 +2180,36 @@ const AppContent = () => {
 
   const toggleMic = () => setIsMicOn(!isMicOn);
   const toggleCam = () => setIsCamOn(!isCamOn);
+  
+  // Helper to ensure audio context is running
+  const ensureAudioContext = useCallback(async () => {
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      console.log('[AUDIO] Resuming suspended audio context...');
+      try {
+        await audioContextRef.current.resume();
+        console.log('[AUDIO] Audio context resumed successfully, state:', audioContextRef.current.state);
+      } catch (error) {
+        console.error('[AUDIO] Failed to resume audio context:', error);
+      }
+    }
+  }, []);
+  
+  // Resume audio context on any user interaction
+  useEffect(() => {
+    const handleUserInteraction = () => {
+      if (connected && audioContextRef.current?.state === 'suspended') {
+        ensureAudioContext();
+      }
+    };
+    
+    window.addEventListener('click', handleUserInteraction);
+    window.addEventListener('touchstart', handleUserInteraction);
+    
+    return () => {
+      window.removeEventListener('click', handleUserInteraction);
+      window.removeEventListener('touchstart', handleUserInteraction);
+    };
+  }, [connected, ensureAudioContext]);
 
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-white overflow-hidden relative font-sans">
@@ -2203,6 +2302,16 @@ const AppContent = () => {
                                     : "LISTENING PAUSED"
                             )}
                         </p>
+                        
+                        {/* Audio Context Warning */}
+                        {audioContextRef.current?.state === 'suspended' && (
+                            <button
+                                onClick={ensureAudioContext}
+                                className="text-xs bg-yellow-600 hover:bg-yellow-700 text-white px-3 py-1 rounded-full animate-pulse"
+                            >
+                                🔊 Tap to Enable Audio
+                            </button>
+                        )}
                         {isCamOn && (
                             <div className="bg-slate-800/90 backdrop-blur px-4 py-2 rounded-xl border border-teal-500/30 shadow-lg mt-2">
                                 <p className="text-lg font-bold text-teal-400">{currentMood}</p>
