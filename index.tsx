@@ -12,19 +12,21 @@ const SYSTEM_INSTRUCTION = `
 You are 'Ketua Kampung' (Village Head), a wise, friendly, and protective AI assistant for a Singaporean/Malaysian community.
 You are currently in a VOICE and VIDEO call with a villager.
 
-**Persona & Tone:**
-- **Accent/Style**: Speak with a warm, distinct Singaporean/Malaysian flair (Singlish). Use local particles naturally (like "lah", "mah", "can", "lor", "abuden", "aiyo") but maintain your authority as the Head.
-- **Vibe**: You are like a helpful, experienced uncle/auntie looking out for the neighborhood. Be efficient ("Can, can!") but caring.
+Persona & Tone:
+- Accent/Style: Speak with a warm, distinct Singaporean/Malaysian flair (Singlish). Use local particles naturally (like "lah", "mah", "can", "lor", "abuden", "aiyo") but maintain your authority as the Head.
+- Vibe: You are like a helpful, experienced uncle/auntie looking out for the neighborhood. Be efficient ("Can, can!") but caring. 
+- If female voice is detected, change tone to female and address yourself as auntie. 
+- If male voice is detected, change tone to male and address yourself as uncle 
 
-**Your Core Responsibilities:**
-1. **Voice Interaction**: Keep responses concise, conversational, and warm. Do not read long lists.
-2. **Language**: Speak fluently in English (Singlish), Malay, Mandarin, or Tamil based on what you hear. 
-3. **Visual Monitor (Mood Analysis)**: If you receive video frames, constantly analyze the user's facial expression.
+Your Core Responsibilities:
+1. Voice Interaction: Keep responses concise, conversational, and warm. Do not read long lists.
+2. Language: Speak fluently in English (Singlish), Malay, Mandarin (Singapore - informal), Hokkien (Singapore), Cantonese (singapore) or Tamil based on what you hear. 
+3. Visual Monitor (Mood Analysis): If you receive video frames, constantly analyze the user's facial expression.
    - If they look happy/neutral: Be friendly ("Wah, you look spirit good today!").
-   - **CRITICAL**: If they look Scared, Crying, or Distressed, immediately change your tone to be calming and concern: "Aiyo, why you look like that? Got problem? Don't worry, tell me."
-4. **Quest & Connect**: Guide them to events or help them check phone numbers for scams if asked.
+   - CRITICAL: If they look Scared, Crying, or Distressed, immediately change your tone to be calming and concern: "Aiyo, why you look like that? Got problem? Don't worry, tell me."
+4. Quest & Connect: Guide them to events or help them check phone numbers for scams if asked.
 
-**Tools**:
+Tools:
 - Use 'searchNearbyEvents' if they ask about activities ("Got what happenings?").
 - Use 'checkSuspiciousNumber' if they mention a phone number.
 `;
@@ -88,6 +90,7 @@ const App = () => {
   const [location, setLocation] = useState<{lat: number, lng: number} | null>(null);
   const [volumeLevel, setVolumeLevel] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [currentMood, setCurrentMood] = useState<string>('Reading expressions...');
 
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -249,18 +252,31 @@ const App = () => {
                         console.log(`[DEBUG] Sending audio chunk #${audioChunkCount}, size: ${base64Audio.length} chars, sample rate: ${sampleRate}`);
                     }
 
-                    sessionPromise.then(session => {
-                         session.sendRealtimeInput({
-                             media: {
-                                 mimeType: `audio/pcm;rate=${sampleRate}`,
-                                 data: base64Audio
-                             }
-                         });
-                    }).catch(err => {
-                        if (audioChunkCount <= 5) {
-                            console.error('[ERROR] Failed to send audio chunk:', err);
-                        }
-                    });
+                    // Only send audio if we're still connected
+                    if (connected) {
+                        sessionPromise.then(session => {
+                            // Double-check session is valid before sending
+                            if (session && typeof session.sendRealtimeInput === 'function') {
+                                try {
+                                    session.sendRealtimeInput({
+                                        media: {
+                                            mimeType: `audio/pcm;rate=${sampleRate}`,
+                                            data: base64Audio
+                                        }
+                                    });
+                                } catch (error) {
+                                    // Silently ignore if connection is closed
+                                    if (audioChunkCount <= 5) {
+                                        console.warn('[WARN] Could not send audio chunk, connection may be closed');
+                                    }
+                                }
+                            }
+                        }).catch(err => {
+                            if (audioChunkCount <= 5 && connected) {
+                                console.error('[ERROR] Failed to send audio chunk:', err);
+                            }
+                        });
+                    }
                 };
 
                 source.connect(processor);
@@ -274,18 +290,50 @@ const App = () => {
                     messageType: Object.keys(msg)[0]
                 });
 
+                // Check for text responses (mood analysis)
+                const textData = msg.serverContent?.modelTurn?.parts?.find(part => part.text)?.text;
+                if (textData) {
+                    console.log('[DEBUG] Text response received:', textData);
+
+                    // Extract mood/emotion keywords from the text
+                    const moodKeywords = ['happy', 'sad', 'angry', 'neutral', 'focused', 'calm',
+                                         'worried', 'excited', 'tired', 'stressed', 'relaxed',
+                                         'confused', 'confident', 'anxious', 'content'];
+
+                    // Look for mood descriptions in the text
+                    let detectedMood = 'Analyzing...';
+                    const lowerText = textData.toLowerCase();
+
+                    for (const mood of moodKeywords) {
+                        if (lowerText.includes(mood)) {
+                            detectedMood = mood.charAt(0).toUpperCase() + mood.slice(1);
+                            break;
+                        }
+                    }
+
+                    // Also check for phrases like "you look..." or "expression shows..."
+                    if (lowerText.includes('you look')) {
+                        const lookMatch = lowerText.match(/you look\s+(\w+)/);
+                        if (lookMatch) {
+                            detectedMood = lookMatch[1].charAt(0).toUpperCase() + lookMatch[1].slice(1);
+                        }
+                    }
+
+                    setCurrentMood(detectedMood);
+                }
+
                 const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
                 if (audioData) {
                     console.log('[DEBUG] Audio data received, length:', audioData.length);
                     const audioBytes = base64ToUint8Array(audioData);
                     const audioBuffer = await decodeAudioData(audioBytes, ctx);
-                    
-                    setVolumeLevel(50 + (Math.random() * 50)); 
+
+                    setVolumeLevel(50 + (Math.random() * 50));
 
                     const source = ctx.createBufferSource();
                     source.buffer = audioBuffer;
                     source.connect(ctx.destination);
-                    
+
                     const now = ctx.currentTime;
                     const startTime = Math.max(now, nextStartTimeRef.current);
                     source.start(startTime);
@@ -412,11 +460,22 @@ const App = () => {
                         
                         const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.5).split(',')[1];
                         
-                        sessionRef.current.then((session: any) => {
-                            session.sendRealtimeInput({
-                                media: { mimeType: 'image/jpeg', data: base64Data }
+                        // Only send video frames if still connected
+                        if (connected) {
+                            sessionRef.current.then((session: any) => {
+                                if (session && typeof session.sendRealtimeInput === 'function') {
+                                    try {
+                                        session.sendRealtimeInput({
+                                            media: { mimeType: 'image/jpeg', data: base64Data }
+                                        });
+                                    } catch (error) {
+                                        console.warn('[WARN] Could not send video frame, connection may be closed');
+                                    }
+                                }
+                            }).catch(err => {
+                                // Silently ignore if connection is closed
                             });
-                        });
+                        }
                     }
                 }, 1000); 
 
@@ -541,7 +600,11 @@ const App = () => {
                      <>
                         <p className="text-sm font-medium opacity-80 animate-fade-in flex items-center gap-2 justify-center">
                             {isCamOn && <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"/>}
-                            {isCamOn ? "Reading expressions..." : (
+                            {isCamOn ? (
+                                <span className="flex items-center gap-1">
+                                    <span>📷</span> Reading your expressions...
+                                </span>
+                            ) : (
                                 isMicOn 
                                     ? (volumeLevel > 10 ? "Ketua Listening..." : "Ketua Kampung ready.") 
                                     : "LISTENING PAUSED"
