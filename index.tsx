@@ -8,8 +8,20 @@ import {
 
 // --- Configuration & Types ---
 
-// Capture API Key safely at module level for use in both GenAI and Maps
-const API_KEY = process.env.API_KEY;
+// ============================================================================
+// API KEY CONFIGURATION
+// ============================================================================
+
+// 1. Main Gemini API Key (Used for Voice, Text, and Vision)
+const GEMINI_API_KEY = process.env.API_KEY;
+
+// 2. Google Maps API Key (Used for 3D Maps)
+// By default, this uses the same key. 
+// IF YOU HAVE A DIFFERENT KEY FOR MAPS, REPLACE process.env.API_KEY BELOW WITH YOUR KEY STRING.
+// Example: const MAPS_API_KEY = "AIzaSyYourMapsKeyHere";
+const MAPS_API_KEY = process.env.API_KEY;
+
+// ============================================================================
 
 const SYSTEM_INSTRUCTION = `
 You are 'Ketua Kampung' (Village Head), a wise, friendly, and protective AI assistant for a Singaporean/Malaysian community.
@@ -98,10 +110,24 @@ declare global {
   interface Window {
     google: any;
   }
+}
+
+// Augment React's JSX namespace to recognize custom Google Maps 3D elements
+declare module 'react' {
   namespace JSX {
     interface IntrinsicElements {
-      'gmp-map-3d': any;
-      'gmp-map-3d-marker': any;
+      'gmp-map-3d': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> & {
+        center?: string;
+        tilt?: string;
+        range?: string;
+        heading?: string;
+        ref?: any;
+        style?: React.CSSProperties;
+      };
+      'gmp-map-3d-marker': React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> & {
+        position?: string;
+        label?: string;
+      };
     }
   }
 }
@@ -117,10 +143,10 @@ const GoogleMap3D = ({ events, userLocation, onClose }: { events: typeof MOCK_EV
                 if (!window.google?.maps?.importLibrary) {
                     const script = document.createElement('script');
                     // Note: 'v=alpha' is currently required for 3D Maps
-                    // Use the module-level API_KEY constant
-                    script.src = `https://maps.googleapis.com/maps/api/js?key=${API_KEY}&v=alpha&libraries=maps3d`;
+                    // Use the separate MAPS_API_KEY
+                    script.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_API_KEY}&v=alpha&libraries=maps3d`;
                     script.async = true;
-                    script.onerror = () => setError("Failed to load Google Maps script.");
+                    script.onerror = () => setError("Failed to load Google Maps script. Check API Key.");
                     document.head.appendChild(script);
                     await new Promise((resolve, reject) => {
                         script.onload = resolve;
@@ -199,8 +225,8 @@ const GoogleMap3D = ({ events, userLocation, onClose }: { events: typeof MOCK_EV
 
 // --- App Component ---
 
-// Initialize GenAI with the same key
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+// Initialize GenAI with the GEMINI key
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 const App = () => {
   // State
