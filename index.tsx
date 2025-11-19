@@ -1125,6 +1125,29 @@ const AppContent = () => {
                   properties: { phoneNumber: { type: Type.STRING } },
                   required: ["phoneNumber"]
                 }
+              },
+              {
+                name: "createQuestToDestination",
+                description: "Create a quest/navigation to a destination when user mentions wanting to go somewhere. Use this when they say phrases like 'bring me to', 'I want to go to', 'navigate to', 'where is', 'how to get to', etc.",
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    destinationName: {
+                      type: Type.STRING,
+                      description: "The name of the destination (e.g., 'kopitiam', 'MRT station', 'hawker center', 'market', etc.)"
+                    },
+                    destinationType: {
+                      type: Type.STRING,
+                      description: "Type of place: restaurant, transit_station, shopping_mall, park, hospital, etc."
+                    }
+                  },
+                  required: ["destinationName"]
+                }
+              },
+              {
+                name: "getActiveQuestStatus",
+                description: "Get the status of the active quest including progress, current waypoint, and distance remaining.",
+                parameters: { type: Type.OBJECT, properties: {} }
               }
             ]
           }]
@@ -1192,12 +1215,81 @@ const AppContent = () => {
                     for (const fc of msg.toolCall.functionCalls) {
                          let result = {};
                          if (fc.name === 'searchNearbyEvents') {
-                             result = { events: MOCK_EVENTS };
+                             result = { events: communityEvents };
                          } else if (fc.name === 'checkSuspiciousNumber') {
                              const args: any = fc.args;
                              const num = args.phoneNumber || "";
                              const isScam = MOCK_SCAM_NUMBERS.some(n => num.includes(n));
                              result = { isSuspicious: isScam, message: isScam ? "DANGER: Scam detected." : "Seems safe." };
+                         } else if (fc.name === 'createQuestToDestination') {
+                             const args: any = fc.args;
+                             const destinationName = args.destinationName || "";
+                             const destinationType = args.destinationType || "point_of_interest";
+                             
+                             // Search for the destination using Google Places API
+                             if (window.google && location) {
+                                 const service = new google.maps.places.PlacesService(document.createElement('div'));
+                                 const request: google.maps.places.TextSearchRequest = {
+                                     query: destinationName,
+                                     location: new google.maps.LatLng(location.lat, location.lng),
+                                     radius: 5000,
+                                     type: destinationType
+                                 };
+                                 
+                                 service.textSearch(request, (results, status) => {
+                                     if (status === google.maps.places.PlacesServiceStatus.OK && results && results[0]) {
+                                         const place = results[0];
+                                         const newQuest = generateQuestFromDestination(place, location);
+                                         setQuests(prev => [...prev, newQuest]);
+                                         setActiveQuest({ ...newQuest, status: 'active' });
+                                         setMode('quest');
+                                         setQuestView('map');
+                                         
+                                         result = {
+                                             success: true,
+                                             message: `Quest created to ${place.name}! Distance: ${newQuest.distance} km, estimated time: ${newQuest.duration} minutes. Follow the green route on the map!`,
+                                             questDetails: {
+                                                 destination: place.name,
+                                                 distance: newQuest.distance,
+                                                 duration: newQuest.duration,
+                                                 reward: newQuest.reward
+                                             }
+                                         };
+                                     } else {
+                                         result = {
+                                             success: false,
+                                             message: `Sorry, cannot find ${destinationName}. Can you be more specific?`
+                                         };
+                                     }
+                                 });
+                             } else {
+                                 result = {
+                                     success: false,
+                                     message: "Location not available or Maps not loaded. Please enable location access."
+                                 };
+                             }
+                         } else if (fc.name === 'getActiveQuestStatus') {
+                             if (activeQuest) {
+                                 const completedWaypoints = activeQuest.waypoints.filter(wp => wp.completed).length;
+                                 const nextWaypoint = activeQuest.waypoints.find(wp => !wp.completed);
+                                 
+                                 result = {
+                                     hasActiveQuest: true,
+                                     questName: activeQuest.title,
+                                     destination: activeQuest.destination.name,
+                                     progress: activeQuest.progress,
+                                     completedCheckpoints: completedWaypoints,
+                                     totalCheckpoints: activeQuest.waypoints.length,
+                                     nextCheckpoint: nextWaypoint ? nextWaypoint.name : "Final destination",
+                                     distanceRemaining: activeQuest.distance * (1 - activeQuest.progress / 100),
+                                     reward: activeQuest.reward
+                                 };
+                             } else {
+                                 result = {
+                                     hasActiveQuest: false,
+                                     message: "No active quest. Ask me to bring you somewhere!"
+                                 };
+                             }
                          }
                          
                          sessionPromise.then(session => {
@@ -2116,7 +2208,7 @@ const AppContent = () => {
                       className="p-4 bg-slate-700 rounded-full hover:bg-slate-600 transition"
                       title="Toggle Camera"
                   >
-                      {cameraOn ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
+                      <Video className="w-6 h-6" />
                   </button>
 
                   <button
@@ -2132,7 +2224,7 @@ const AppContent = () => {
                       className="p-4 bg-slate-700 rounded-full hover:bg-slate-600 transition"
                       title="Toggle Microphone"
                   >
-                      {micOn ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
+                      <Mic className="w-6 h-6" />
                   </button>
 
                   <button
