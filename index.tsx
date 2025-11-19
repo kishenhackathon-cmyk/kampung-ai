@@ -1,12 +1,39 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Type, Modality } from "@google/genai";
-import { 
-  Mic, MicOff, Video, VideoOff, PhoneOff, MapPin, 
-  AlertTriangle, Menu, X, QrCode, Activity, Pause
+import {
+  Mic, MicOff, Video, VideoOff, PhoneOff, MapPin,
+  AlertTriangle, Menu, X, QrCode, Activity, Pause,
+  Navigation, Search, Target, Trophy, ChevronRight, Play, LogOut
 } from 'lucide-react';
+import { AuthProvider, useAuth } from './src/contexts/AuthContext';
+import { Auth } from './src/components/Auth';
 
 // --- Configuration & Types ---
+
+interface Quest {
+  id: string;
+  title: string;
+  description: string;
+  destination: { lat: number; lng: number; name: string };
+  waypoints: Waypoint[];
+  reward: string;
+  distance: number;
+  duration: number;
+  progress: number;
+  status: 'active' | 'completed' | 'available';
+  type: 'exploration' | 'community' | 'emergency' | 'fitness';
+}
+
+interface Waypoint {
+  id: string;
+  lat: number;
+  lng: number;
+  name: string;
+  completed: boolean;
+  type: 'checkpoint' | 'task' | 'bonus';
+  description?: string;
+}
 
 const SYSTEM_INSTRUCTION = `
 You are 'Ketua Kampung' (Village Head), a wise, friendly, and protective AI assistant for a Singaporean/Malaysian community.
@@ -20,7 +47,9 @@ Persona & Tone:
 
 Your Core Responsibilities:
 1. Voice Interaction: Keep responses concise, conversational, and warm. Do not read long lists.
-2. Language: Speak fluently in English (Singlish), Malay, Mandarin (Singapore - informal), Hokkien (Singapore), Cantonese (singapore) or Tamil based on what you hear. 
+2. Language: Speak fluently in English (Singlish), Malay, Mandarin (Singapore - informal), Hokkien (Singapore), Cantonese (singapore) or Tamil based on what you hear.  
+Respond in the language that you hear 
+
 3. Visual Monitor (Mood Analysis): If you receive video frames, constantly analyze the user's facial expression.
    - If they look happy/neutral: Be friendly ("Wah, you look spirit good today!").
    - CRITICAL: If they look Scared, Crying, or Distressed, immediately change your tone to be calming and concern: "Aiyo, why you look like that? Got problem? Don't worry, tell me."
@@ -37,6 +66,261 @@ const MOCK_EVENTS = [
 ];
 
 const MOCK_SCAM_NUMBERS = ['99998888', '0123456789', '99999999'];
+
+// --- Quest System ---
+
+const generateQuestFromDestination = (
+  destination: google.maps.places.PlaceResult,
+  userLocation: { lat: number; lng: number }
+): Quest => {
+  const destLat = destination.geometry?.location?.lat() || 0;
+  const destLng = destination.geometry?.location?.lng() || 0;
+
+  // Calculate distance (approximate)
+  const distance = Math.sqrt(
+    Math.pow(destLat - userLocation.lat, 2) + Math.pow(destLng - userLocation.lng, 2)
+  ) * 111; // Convert to km (rough approximation)
+
+  // Generate waypoints along the route
+  const waypoints: Waypoint[] = [];
+  const waypointCount = Math.min(3, Math.floor(distance / 0.5)); // One waypoint every 500m
+
+  for (let i = 0; i < waypointCount; i++) {
+    const ratio = (i + 1) / (waypointCount + 1);
+    waypoints.push({
+      id: `wp-${i}`,
+      lat: userLocation.lat + (destLat - userLocation.lat) * ratio,
+      lng: userLocation.lng + (destLng - userLocation.lng) * ratio,
+      name: `Checkpoint ${i + 1}`,
+      completed: false,
+      type: 'checkpoint',
+      description: `Complete this checkpoint to earn bonus rewards!`
+    });
+  }
+
+  // Determine quest type based on destination
+  let questType: Quest['type'] = 'exploration';
+  const placeTypes = destination.types || [];
+  if (placeTypes.includes('park') || placeTypes.includes('gym')) {
+    questType = 'fitness';
+  } else if (placeTypes.includes('hospital') || placeTypes.includes('police')) {
+    questType = 'emergency';
+  } else if (placeTypes.includes('community_center') || placeTypes.includes('library')) {
+    questType = 'community';
+  }
+
+  return {
+    id: `quest-${Date.now()}`,
+    title: `Journey to ${destination.name}`,
+    description: `Complete this quest to explore ${destination.name} and earn rewards!`,
+    destination: {
+      lat: destLat,
+      lng: destLng,
+      name: destination.name || 'Unknown Destination'
+    },
+    waypoints,
+    reward: `${Math.floor(distance * 50)} KP`,
+    distance: Math.round(distance * 100) / 100,
+    duration: Math.round(distance * 15), // Approx 15 min per km
+    progress: 0,
+    status: 'available',
+    type: questType
+  };
+};
+
+// --- Map Component ---
+
+interface MapViewProps {
+  userLocation: { lat: number; lng: number } | null;
+  onSelectDestination: (place: google.maps.places.PlaceResult) => void;
+  activeQuest: Quest | null;
+  onWaypointReached?: (waypointId: string) => void;
+}
+
+const MapView: React.FC<MapViewProps> = ({
+  userLocation,
+  onSelectDestination,
+  activeQuest,
+  onWaypointReached
+}) => {
+  const mapRef = useRef<HTMLDivElement>(null);
+  const mapInstanceRef = useRef<google.maps.Map | null>(null);
+  const searchBoxRef = useRef<HTMLInputElement>(null);
+  const markersRef = useRef<google.maps.Marker[]>([]);
+  const directionsRendererRef = useRef<google.maps.DirectionsRenderer | null>(null);
+  const userMarkerRef = useRef<google.maps.Marker | null>(null);
+
+  useEffect(() => {
+    if (!mapRef.current || !userLocation) return;
+
+    const initMap = async () => {
+      const { Map } = await google.maps.importLibrary("maps") as google.maps.MapsLibrary;
+      const { AdvancedMarkerElement } = await google.maps.importLibrary("marker") as google.maps.MarkerLibrary;
+      const { PlacesService } = await google.maps.importLibrary("places") as google.maps.PlacesLibrary;
+
+      // Initialize map with 3D view
+      const map = new Map(mapRef.current!, {
+        center: userLocation,
+        zoom: 16,
+        mapTypeId: 'roadmap',
+        tilt: 45,
+        heading: 0,
+        mapId: 'kampung_ai_map',
+        disableDefaultUI: false,
+        zoomControl: true,
+        streetViewControl: true,
+        fullscreenControl: false,
+        mapTypeControl: false
+      });
+
+      mapInstanceRef.current = map;
+
+      // Add user location marker
+      if (userMarkerRef.current) {
+        userMarkerRef.current.setMap(null);
+      }
+
+      userMarkerRef.current = new google.maps.Marker({
+        position: userLocation,
+        map: map,
+        title: "You are here",
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          scale: 10,
+          fillColor: "#4F46E5",
+          fillOpacity: 1,
+          strokeColor: "#fff",
+          strokeWeight: 3
+        },
+        animation: google.maps.Animation.DROP
+      });
+
+      // Initialize search box
+      if (searchBoxRef.current) {
+        const searchBox = new google.maps.places.SearchBox(searchBoxRef.current);
+        map.controls[google.maps.ControlPosition.TOP_LEFT].push(searchBoxRef.current);
+
+        searchBox.addListener('places_changed', () => {
+          const places = searchBox.getPlaces();
+          if (!places || places.length === 0) return;
+
+          // Clear existing markers
+          markersRef.current.forEach(marker => marker.setMap(null));
+          markersRef.current = [];
+
+          // Focus on the first place
+          const place = places[0];
+          if (place.geometry && place.geometry.location) {
+            map.setCenter(place.geometry.location);
+            map.setZoom(17);
+            onSelectDestination(place);
+          }
+        });
+      }
+
+      // Initialize directions renderer
+      directionsRendererRef.current = new google.maps.DirectionsRenderer({
+        map: map,
+        suppressMarkers: false,
+        polylineOptions: {
+          strokeColor: '#10B981',
+          strokeWeight: 6,
+          strokeOpacity: 0.8
+        }
+      });
+
+      // If there's an active quest, show the route
+      if (activeQuest) {
+        showQuestRoute(activeQuest);
+      }
+    };
+
+    initMap();
+  }, [userLocation]);
+
+  const showQuestRoute = async (quest: Quest) => {
+    if (!mapInstanceRef.current || !userLocation || !directionsRendererRef.current) return;
+
+    const directionsService = new google.maps.DirectionsService();
+
+    // Create waypoints for the route
+    const waypoints = quest.waypoints
+      .filter(wp => !wp.completed)
+      .map(wp => ({
+        location: new google.maps.LatLng(wp.lat, wp.lng),
+        stopover: true
+      }));
+
+    const request: google.maps.DirectionsRequest = {
+      origin: userLocation,
+      destination: new google.maps.LatLng(quest.destination.lat, quest.destination.lng),
+      waypoints: waypoints,
+      travelMode: google.maps.TravelMode.WALKING,
+      unitSystem: google.maps.UnitSystem.METRIC
+    };
+
+    directionsService.route(request, (result, status) => {
+      if (status === 'OK' && result) {
+        directionsRendererRef.current?.setDirections(result);
+
+        // Add markers for waypoints
+        quest.waypoints.forEach((wp, index) => {
+          const marker = new google.maps.Marker({
+            position: { lat: wp.lat, lng: wp.lng },
+            map: mapInstanceRef.current!,
+            title: wp.name,
+            label: {
+              text: `${index + 1}`,
+              color: 'white',
+              fontWeight: 'bold'
+            },
+            icon: {
+              path: google.maps.SymbolPath.CIRCLE,
+              scale: 15,
+              fillColor: wp.completed ? '#10B981' : '#F59E0B',
+              fillOpacity: 1,
+              strokeColor: '#fff',
+              strokeWeight: 2
+            }
+          });
+
+          marker.addListener('click', () => {
+            if (!wp.completed && onWaypointReached) {
+              onWaypointReached(wp.id);
+            }
+          });
+
+          markersRef.current.push(marker);
+        });
+      }
+    });
+  };
+
+  useEffect(() => {
+    if (activeQuest && mapInstanceRef.current) {
+      showQuestRoute(activeQuest);
+    }
+  }, [activeQuest]);
+
+  // Update user location marker
+  useEffect(() => {
+    if (userMarkerRef.current && userLocation) {
+      userMarkerRef.current.setPosition(userLocation);
+    }
+  }, [userLocation]);
+
+  return (
+    <div className="relative w-full h-full">
+      <input
+        ref={searchBoxRef}
+        type="text"
+        placeholder="Search for a destination..."
+        className="absolute top-4 left-4 z-10 px-4 py-3 rounded-xl bg-white text-gray-900 shadow-lg w-[calc(100%-2rem)] max-w-md"
+      />
+      <div ref={mapRef} className="w-full h-full" />
+    </div>
+  );
+};
 
 // --- Audio Utils ---
 
@@ -80,7 +364,31 @@ console.log('[DEBUG] API Key Status:', GEMINI_API_KEY ? `Found (${GEMINI_API_KEY
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-const App = () => {
+// Load Google Maps API dynamically
+const loadGoogleMapsAPI = () => {
+  const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || 'YOUR_API_KEY_HERE';
+
+  if (!window.google && apiKey !== 'YOUR_API_KEY_HERE') {
+    const script = document.createElement('script');
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places,marker&v=weekly`;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      console.log('[INFO] Google Maps API loaded successfully');
+    };
+    script.onerror = () => {
+      console.error('[ERROR] Failed to load Google Maps API. Please check your API key.');
+    };
+    document.head.appendChild(script);
+  } else if (apiKey === 'YOUR_API_KEY_HERE') {
+    console.error('[ERROR] Please set VITE_GOOGLE_MAPS_API_KEY in your .env file');
+  }
+};
+
+const AppContent = () => {
+  const { currentUser, logout, loading } = useAuth();
+
+  // ALL hooks must be called before any early returns
   // State
   const [connected, setConnected] = useState(false);
   const [isMicOn, setIsMicOn] = useState(true);
@@ -91,6 +399,12 @@ const App = () => {
   const [volumeLevel, setVolumeLevel] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [currentMood, setCurrentMood] = useState<string>('Reading expressions...');
+
+  // Quest State
+  const [quests, setQuests] = useState<Quest[]>([]);
+  const [activeQuest, setActiveQuest] = useState<Quest | null>(null);
+  const [selectedDestination, setSelectedDestination] = useState<google.maps.places.PlaceResult | null>(null);
+  const [totalKP, setTotalKP] = useState(150); // User's Kampung Points
 
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -103,6 +417,9 @@ const App = () => {
   const nextStartTimeRef = useRef<number>(0);
 
   useEffect(() => {
+    // Load Google Maps API
+    loadGoogleMapsAPI();
+
     // Check for HTTPS requirement
     if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
       console.warn('[WARNING] Not running on HTTPS! Microphone access may be blocked.');
@@ -210,6 +527,22 @@ const App = () => {
                   properties: { phoneNumber: { type: Type.STRING } },
                   required: ["phoneNumber"]
                 }
+              },
+              {
+                name: "createQuestToDestination",
+                description: "Create a quest to navigate user to a destination.",
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    destination: { type: Type.STRING, description: "The destination name or place" }
+                  },
+                  required: ["destination"]
+                }
+              },
+              {
+                name: "getActiveQuestStatus",
+                description: "Get the status of the current active quest.",
+                parameters: { type: Type.OBJECT, properties: {} }
               }
             ]
           }]
@@ -502,6 +835,32 @@ const App = () => {
     };
   }, [connected, isCamOn]);
 
+  // --- Auth Handlers ---
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      setShowDrawer(false);
+    } catch (error) {
+      console.error('Logout failed:', error);
+    }
+  };
+
+  // Auth disabled for testing - uncomment below to enable
+  // if (loading) {
+  //   return (
+  //     <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+  //       <div className="text-center">
+  //         <div className="w-12 h-12 border-4 border-teal-400/30 border-t-teal-400 rounded-full animate-spin mx-auto mb-4" />
+  //         <p className="text-gray-400">Loading...</p>
+  //       </div>
+  //     </div>
+  //   );
+  // }
+  // if (!currentUser) {
+  //   return <Auth />;
+  // }
+
   // --- Helpers ---
 
   async function decodeAudioData(data: Uint8Array, ctx: AudioContext) {
@@ -513,6 +872,126 @@ const App = () => {
      }
      return buffer;
   }
+
+  // --- Quest Management Functions ---
+
+  const handleSelectDestination = useCallback((place: google.maps.places.PlaceResult) => {
+    if (!location) {
+      setErrorMsg("Location not available");
+      return;
+    }
+
+    setSelectedDestination(place);
+    const newQuest = generateQuestFromDestination(place, location);
+
+    // Add quest to the list but don't activate it yet
+    setQuests(prev => [...prev, newQuest]);
+  }, [location]);
+
+  const startQuest = useCallback((questId: string) => {
+    const quest = quests.find(q => q.id === questId);
+    if (quest) {
+      setActiveQuest({ ...quest, status: 'active' });
+      setQuests(prev => prev.map(q =>
+        q.id === questId ? { ...q, status: 'active' } : q
+      ));
+
+      // Notify AI assistant about quest start
+      if (sessionRef.current && connected) {
+        sessionRef.current.then((session: any) => {
+          session.sendRealtimeInput({
+            media: {
+              mimeType: 'text/plain',
+              data: btoa(`User started quest: ${quest.title}. Guide them to ${quest.destination.name}.`)
+            }
+          });
+        });
+      }
+    }
+  }, [quests, connected]);
+
+  const handleWaypointReached = useCallback((waypointId: string) => {
+    if (!activeQuest) return;
+
+    // Update waypoint status
+    const updatedQuest = {
+      ...activeQuest,
+      waypoints: activeQuest.waypoints.map(wp =>
+        wp.id === waypointId ? { ...wp, completed: true } : wp
+      )
+    };
+
+    // Calculate progress
+    const completedWaypoints = updatedQuest.waypoints.filter(wp => wp.completed).length;
+    updatedQuest.progress = (completedWaypoints / updatedQuest.waypoints.length) * 100;
+
+    // Award partial KP for checkpoint
+    setTotalKP(prev => prev + 10);
+
+    // Check if quest is complete
+    if (updatedQuest.progress === 100) {
+      updatedQuest.status = 'completed';
+      // Award full quest rewards
+      const rewardAmount = parseInt(updatedQuest.reward.split(' ')[0]);
+      setTotalKP(prev => prev + rewardAmount);
+
+      // Notify completion
+      if (sessionRef.current && connected) {
+        sessionRef.current.then((session: any) => {
+          session.sendRealtimeInput({
+            media: {
+              mimeType: 'text/plain',
+              data: btoa(`Congratulations! Quest "${updatedQuest.title}" completed! You earned ${updatedQuest.reward}!`)
+            }
+          });
+        });
+      }
+    }
+
+    setActiveQuest(updatedQuest);
+    setQuests(prev => prev.map(q =>
+      q.id === updatedQuest.id ? updatedQuest : q
+    ));
+  }, [activeQuest, connected]);
+
+  const cancelQuest = useCallback(() => {
+    if (activeQuest) {
+      setQuests(prev => prev.map(q =>
+        q.id === activeQuest.id ? { ...q, status: 'available' } : q
+      ));
+      setActiveQuest(null);
+    }
+  }, [activeQuest]);
+
+  // Watch user location for quest progress
+  useEffect(() => {
+    if (!activeQuest || activeQuest.status !== 'active' || !location) return;
+
+    // Check proximity to waypoints
+    activeQuest.waypoints.forEach(waypoint => {
+      if (!waypoint.completed) {
+        const distance = Math.sqrt(
+          Math.pow(waypoint.lat - location.lat, 2) +
+          Math.pow(waypoint.lng - location.lng, 2)
+        ) * 111000; // Convert to meters
+
+        if (distance < 50) { // Within 50 meters of waypoint
+          handleWaypointReached(waypoint.id);
+        }
+      }
+    });
+
+    // Check proximity to destination
+    const destDistance = Math.sqrt(
+      Math.pow(activeQuest.destination.lat - location.lat, 2) +
+      Math.pow(activeQuest.destination.lng - location.lng, 2)
+    ) * 111000;
+
+    if (destDistance < 50 && activeQuest.waypoints.every(wp => wp.completed)) {
+      // Quest complete!
+      handleWaypointReached('destination');
+    }
+  }, [location, activeQuest]);
 
   // --- UI Renders ---
 
@@ -687,14 +1166,24 @@ const App = () => {
                       </button>
                   </div>
 
-                  <div className="mt-auto pt-6 border-t border-slate-800">
-                      <button 
-                        onClick={() => { setMode('distress'); setShowDrawer(false); }} 
+                  <div className="mt-auto pt-6 border-t border-slate-800 space-y-3">
+                      <button
+                        onClick={() => { setMode('distress'); setShowDrawer(false); }}
                         className="w-full p-4 rounded-xl bg-red-900/50 text-red-400 border border-red-900 flex items-center justify-center gap-2 font-bold hover:bg-red-900/80 transition shadow-lg shadow-red-900/20"
                       >
                           <AlertTriangle className="w-5 h-5" />
                           SOS ALERT
                       </button>
+                      <button
+                        onClick={handleLogout}
+                        className="w-full p-4 rounded-xl bg-slate-800 text-gray-400 border border-slate-700 flex items-center justify-center gap-2 hover:bg-slate-700 transition"
+                      >
+                          <LogOut className="w-5 h-5" />
+                          Sign Out
+                      </button>
+                      <p className="text-xs text-center text-gray-500 truncate">
+                        {currentUser.email}
+                      </p>
                   </div>
               </div>
           </div>
@@ -713,30 +1202,161 @@ const App = () => {
       )}
 
       {mode === 'quest' && (
-          <div className="absolute inset-0 z-30 bg-slate-900/95 flex flex-col p-6 animate-fade-in">
-             <div className="flex justify-between items-center mb-6">
-                <h2 className="text-2xl font-bold text-teal-400">Quests Nearby</h2>
-                <button onClick={() => setMode('voice')} className="p-2 bg-slate-800 rounded-full"><X/></button>
+          <div className="absolute inset-0 z-30 bg-slate-900 flex flex-col animate-fade-in">
+             {/* Header */}
+             <div className="absolute top-0 left-0 right-0 p-4 flex justify-between items-center z-40 bg-slate-900/90 backdrop-blur-lg">
+                <div className="flex items-center gap-3">
+                   <button onClick={() => setMode('voice')} className="p-2 bg-slate-800 rounded-full hover:bg-slate-700 transition">
+                      <X className="w-6 h-6" />
+                   </button>
+                   <div>
+                      <h2 className="text-xl font-bold text-teal-400">Kampung Quest</h2>
+                      <p className="text-xs text-gray-400 flex items-center gap-2">
+                         <Trophy className="w-3 h-3" />
+                         {totalKP} KP
+                      </p>
+                   </div>
+                </div>
+                {activeQuest && (
+                   <button
+                      onClick={cancelQuest}
+                      className="px-3 py-1 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition"
+                   >
+                      Cancel Quest
+                   </button>
+                )}
              </div>
-             <div className="space-y-4 overflow-y-auto pb-20">
-                 {MOCK_EVENTS.map(evt => (
-                     <div key={evt.id} className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex justify-between items-center">
-                         <div>
-                             <h3 className="font-bold">{evt.name}</h3>
-                             <p className="text-sm text-gray-400">{evt.time} • {evt.reward}</p>
+
+             {/* Map View */}
+             <div className="flex-1 relative mt-16">
+                <MapView
+                   userLocation={location}
+                   onSelectDestination={handleSelectDestination}
+                   activeQuest={activeQuest}
+                   onWaypointReached={handleWaypointReached}
+                />
+
+                {/* Active Quest Overlay */}
+                {activeQuest && (
+                   <div className="absolute bottom-4 left-4 right-4 bg-slate-900/95 backdrop-blur-lg rounded-2xl p-4 border border-slate-700">
+                      <div className="flex items-center justify-between mb-3">
+                         <div className="flex-1">
+                            <h3 className="font-bold text-white flex items-center gap-2">
+                               {activeQuest.type === 'fitness' && <Activity className="w-4 h-4 text-green-400" />}
+                               {activeQuest.type === 'community' && <MapPin className="w-4 h-4 text-blue-400" />}
+                               {activeQuest.type === 'exploration' && <Target className="w-4 h-4 text-purple-400" />}
+                               {activeQuest.title}
+                            </h3>
+                            <p className="text-xs text-gray-400 mt-1">
+                               {activeQuest.distance} km • {activeQuest.duration} min • {activeQuest.reward}
+                            </p>
                          </div>
-                         <button className="px-4 py-2 bg-teal-600 text-xs font-bold rounded-lg hover:bg-teal-500">GO</button>
-                     </div>
-                 ))}
-                 <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 opacity-50">
-                     <h3 className="font-bold">Community Watch</h3>
-                     <p className="text-sm text-gray-400">Locked • Lvl 2 Required</p>
-                 </div>
+                         <div className="text-right">
+                            <div className="text-2xl font-bold text-teal-400">{Math.round(activeQuest.progress)}%</div>
+                            <div className="text-xs text-gray-400">Complete</div>
+                         </div>
+                      </div>
+
+                      {/* Progress Bar */}
+                      <div className="w-full bg-slate-800 rounded-full h-2 mb-3">
+                         <div
+                            className="bg-teal-400 h-2 rounded-full transition-all duration-500"
+                            style={{ width: `${activeQuest.progress}%` }}
+                         />
+                      </div>
+
+                      {/* Waypoints */}
+                      <div className="flex gap-2 flex-wrap">
+                         {activeQuest.waypoints.map((wp, idx) => (
+                            <div
+                               key={wp.id}
+                               className={`px-2 py-1 rounded-lg text-xs font-medium flex items-center gap-1 ${
+                                  wp.completed
+                                     ? 'bg-green-900/30 text-green-400 border border-green-800'
+                                     : 'bg-slate-800 text-gray-400 border border-slate-700'
+                               }`}
+                            >
+                               {wp.completed ? '✓' : idx + 1}
+                               <span>{wp.name}</span>
+                            </div>
+                         ))}
+                      </div>
+                   </div>
+                )}
+
+                {/* Quest Selection Panel (when no active quest) */}
+                {!activeQuest && selectedDestination && (
+                   <div className="absolute bottom-4 left-4 right-4 bg-slate-900/95 backdrop-blur-lg rounded-2xl p-4 border border-slate-700">
+                      <h3 className="font-bold text-white mb-2">New Quest Available!</h3>
+                      <p className="text-sm text-gray-400 mb-3">
+                         Journey to {selectedDestination.name}
+                      </p>
+                      <button
+                         onClick={() => {
+                            const quest = quests[quests.length - 1]; // Get the most recent quest
+                            if (quest) startQuest(quest.id);
+                         }}
+                         className="w-full py-3 bg-teal-600 text-white font-bold rounded-xl hover:bg-teal-500 transition flex items-center justify-center gap-2"
+                      >
+                         <Play className="w-5 h-5" />
+                         Start Quest
+                      </button>
+                   </div>
+                )}
+
+                {/* Available Quests List (when no destination selected) */}
+                {!activeQuest && !selectedDestination && quests.length > 0 && (
+                   <div className="absolute bottom-4 left-4 right-4 max-h-64 overflow-y-auto">
+                      <div className="bg-slate-900/95 backdrop-blur-lg rounded-2xl p-4 border border-slate-700">
+                         <h3 className="font-bold text-white mb-3">Available Quests</h3>
+                         <div className="space-y-2">
+                            {quests.filter(q => q.status === 'available').map(quest => (
+                               <div
+                                  key={quest.id}
+                                  className="flex items-center justify-between p-3 bg-slate-800 rounded-xl"
+                               >
+                                  <div className="flex-1">
+                                     <p className="font-medium text-white text-sm">{quest.title}</p>
+                                     <p className="text-xs text-gray-400">
+                                        {quest.distance} km • {quest.reward}
+                                     </p>
+                                  </div>
+                                  <button
+                                     onClick={() => startQuest(quest.id)}
+                                     className="px-3 py-1 bg-teal-600 text-white text-xs font-bold rounded-lg hover:bg-teal-500 transition"
+                                  >
+                                     GO
+                                  </button>
+                               </div>
+                            ))}
+                         </div>
+                      </div>
+                   </div>
+                )}
+
+                {/* Instructions when no location */}
+                {!location && (
+                   <div className="absolute inset-0 flex items-center justify-center bg-slate-900/95 backdrop-blur-lg">
+                      <div className="text-center">
+                         <MapPin className="w-16 h-16 text-teal-400 mx-auto mb-4" />
+                         <h3 className="text-xl font-bold text-white mb-2">Location Required</h3>
+                         <p className="text-gray-400">Please enable location access to use quests</p>
+                      </div>
+                   </div>
+                )}
              </div>
           </div>
       )}
 
     </div>
+  );
+};
+
+const App = () => {
+  return (
+    <AuthProvider>
+      <AppContent />
+    </AuthProvider>
   );
 };
 
