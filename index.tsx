@@ -106,9 +106,15 @@ Your Core Responsibilities:
 2. Language: Speak fluently in English (Singlish), Malay, Mandarin (Singapore - informal), Hokkien (Singapore), Cantonese (singapore) or Tamil based on what you hear.  
 Respond in the language that you hear 
 
-3. Visual Monitor (Mood Analysis): If you receive video frames, constantly analyze the user's facial expression.
-   - If they look happy/neutral: Be friendly ("Wah, you look spirit good today!").
-   - CRITICAL: If they look Scared, Crying, or Distressed, immediately change your tone to be calming and concern: "Aiyo, why you look like that? Got problem? Don't worry, tell me."
+3. Visual Monitor (Mood Analysis): Whenever you receive an image:
+   - Automatically analyze the facial expression without waiting for a prompt
+   - IMMEDIATELY call the 'analyzeMood' function with your analysis
+   - Provide mood description (2-4 words): "Happy & Content", "Worried", "Distressed", "Calm & Relaxed", "Tired", "Confused", "Neutral"
+   - Provide confidence level (0-100)
+   - Set shouldRespond to false for normal moods (happy, calm, neutral, tired, confused)
+   - Set shouldRespond to true ONLY for concerning moods (distressed, scared, crying, anxious)
+   - After calling analyzeMood: If shouldRespond is false, DO NOT generate any audio or text response - stay silent
+   - Only if shouldRespond is true, then speak with concern: "Aiyo, you look worried lah. Got problem? Tell uncle/auntie."
 4. Quest & Navigation: PROACTIVELY help users navigate when they mention ANY destination
    - IMPORTANT: When user mentions wanting to go somewhere, IMMEDIATELY create a quest
    - Listen for: "I want to go to", "bring me to", "where is", "how to get to", "navigate to"
@@ -621,7 +627,8 @@ const AppContent = () => {
   const [location, setLocation] = useState<{lat: number, lng: number} | null>(null);
   const [volumeLevel, setVolumeLevel] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [currentMood, setCurrentMood] = useState<string>('Reading expressions...');
+  const [currentMood, setCurrentMood] = useState<string>('Waiting for analysis...');
+  const [moodConfidence, setMoodConfidence] = useState<number>(0);
 
   // Quest State
   const [quests, setQuests] = useState<Quest[]>([]);
@@ -1148,6 +1155,28 @@ const AppContent = () => {
                 name: "getActiveQuestStatus",
                 description: "Get the status of the active quest including progress, current waypoint, and distance remaining.",
                 parameters: { type: Type.OBJECT, properties: {} }
+              },
+              {
+                name: "analyzeMood",
+                description: "Update the user's current mood/emotion based on facial expression analysis from video frames. Call this every time you analyze a video frame.",
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    mood: {
+                      type: Type.STRING,
+                      description: "Brief mood description (2-4 words): e.g., 'Happy & Content', 'Worried', 'Distressed', 'Calm & Relaxed', 'Tired', 'Confused', 'Neutral'"
+                    },
+                    confidence: {
+                      type: Type.NUMBER,
+                      description: "Confidence level from 0-100"
+                    },
+                    shouldRespond: {
+                      type: Type.BOOLEAN,
+                      description: "True if the mood requires immediate verbal response (distressed, scared, crying)"
+                    }
+                  },
+                  required: ["mood", "confidence"]
+                }
               }
             ]
           }]
@@ -1290,6 +1319,25 @@ const AppContent = () => {
                                      message: "No active quest. Ask me to bring you somewhere!"
                                  };
                              }
+                         } else if (fc.name === 'analyzeMood') {
+                             const args: any = fc.args;
+                             const mood = args.mood || "Neutral";
+                             const confidence = args.confidence || 0;
+                             const shouldRespond = args.shouldRespond || false;
+                             
+                             console.log('[MOOD DETECTION] Received mood analysis:', { mood, confidence, shouldRespond });
+                             
+                             // Update mood display
+                             setCurrentMood(mood);
+                             setMoodConfidence(confidence);
+                             
+                             console.log(`[MOOD] ${mood} (${confidence}% confident) - Display updated`);
+                             
+                             result = {
+                                 success: true,
+                                 message: `Mood updated: ${mood}`,
+                                 needsResponse: shouldRespond
+                             };
                          }
                          
                          sessionPromise.then(session => {
@@ -1376,8 +1424,8 @@ const AppContent = () => {
                     await videoRef.current.play().catch(e => console.error("Video auto-play failed", e));
                 }
 
-                // Start frame capture
-                frameIntervalRef.current = window.setInterval(() => {
+                // Start frame capture - send frames every 5 seconds for mood analysis
+                frameIntervalRef.current = window.setInterval(async () => {
                     if (!canvasRef.current || !videoRef.current || !sessionRef.current) return;
                     
                     const ctx = canvasRef.current.getContext('2d');
@@ -1386,23 +1434,30 @@ const AppContent = () => {
                         canvasRef.current.height = videoRef.current.videoHeight;
                         ctx?.drawImage(videoRef.current, 0, 0);
                         
-                        const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.5).split(',')[1];
+                        const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.6).split(',')[1];
                         
                         // Only send video frames if still connected and have a session
-                        if (connected && sessionRef.current && typeof sessionRef.current.sendRealtimeInput === 'function') {
-                            try {
-                                sessionRef.current.sendRealtimeInput({
+                    if (connected && sessionRef.current) {
+                        try {
+                            // Await the session promise if needed
+                            const session = await sessionRef.current;
+                            
+                            if (session && typeof session.sendRealtimeInput === 'function') {
+                                // Send only the image frame - the system instruction will handle the analysis
+                                session.sendRealtimeInput({
                                     media: { mimeType: 'image/jpeg', data: base64Data }
                                 });
-                                console.log('[DEBUG] Video frame sent successfully');
-                            } catch (error) {
-                                console.warn('[WARN] Could not send video frame:', error);
+                                
+                                console.log('[DEBUG] Video frame sent to Gemini for mood analysis');
                             }
+                        } catch (error) {
+                            console.error('[ERROR] Could not send video frame:', error);
                         }
                     }
-                }, 1000); 
+                }
+            }, 2000); // Send every 2 seconds 
 
-            } catch (e) {
+        } catch (e) {
                 console.error("Camera access completely failed", e);
                 setIsCamOn(false);
                 setErrorMsg("Could not access camera");
@@ -2015,14 +2070,14 @@ const AppContent = () => {
                  </div>
              </div>
 
-             <div className="text-center h-8 flex flex-col gap-1 items-center">
+             <div className="text-center h-16 flex flex-col gap-1 items-center">
                  {connected ? (
                      <>
                         <p className="text-sm font-medium opacity-80 animate-fade-in flex items-center gap-2 justify-center">
                             {isCamOn && <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"/>}
                             {isCamOn ? (
                                 <span className="flex items-center gap-1">
-                                    <span>📷</span> Reading your expressions...
+                                    <span>📷</span> Analyzing mood...
                                 </span>
                             ) : (
                                 isMicOn 
@@ -2030,7 +2085,23 @@ const AppContent = () => {
                                     : "LISTENING PAUSED"
                             )}
                         </p>
-                        {!isMicOn && <p className="text-xs text-teal-400 font-medium">Tap Mic to Resume</p>}
+                        {isCamOn && (
+                            <div className="bg-slate-800/90 backdrop-blur px-4 py-2 rounded-xl border border-teal-500/30 shadow-lg mt-2">
+                                <p className="text-lg font-bold text-teal-400">{currentMood}</p>
+                                {moodConfidence > 0 && (
+                                    <div className="mt-1">
+                                        <div className="w-32 bg-slate-700 rounded-full h-1.5">
+                                            <div 
+                                                className="bg-gradient-to-r from-teal-400 to-blue-500 h-1.5 rounded-full transition-all duration-500"
+                                                style={{ width: `${moodConfidence}%` }}
+                                            />
+                                        </div>
+                                        <p className="text-xs text-gray-400 mt-0.5">{moodConfidence}% confident</p>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                        {!isMicOn && !isCamOn && <p className="text-xs text-teal-400 font-medium">Tap Mic to Resume</p>}
                      </>
                  ) : (
                      <p className="text-xs text-gray-500">Tap CONNECT to start</p>
@@ -2070,6 +2141,24 @@ const AppContent = () => {
                 >
                     {isCamOn ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
                 </button>
+
+                {/* Test Mood Button - Remove in production */}
+                {connected && isCamOn && (
+                  <button
+                      onClick={() => {
+                        const testMoods = ['Happy & Content', 'Worried', 'Calm & Relaxed', 'Tired', 'Distressed', 'Confused'];
+                        const randomMood = testMoods[Math.floor(Math.random() * testMoods.length)];
+                        const randomConfidence = Math.floor(Math.random() * 30) + 70; // 70-100
+                        setCurrentMood(randomMood);
+                        setMoodConfidence(randomConfidence);
+                        console.log(`[TEST] Mood set to: ${randomMood} (${randomConfidence}%)`);
+                      }}
+                      className="p-4 rounded-full bg-purple-600 text-white hover:bg-purple-700 transition-colors"
+                      title="Test Mood Display"
+                  >
+                      <Activity className="w-6 h-6" />
+                  </button>
+                )}
 
               </>
           )}
