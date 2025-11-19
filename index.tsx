@@ -53,11 +53,20 @@ Respond in the language that you hear
 3. Visual Monitor (Mood Analysis): If you receive video frames, constantly analyze the user's facial expression.
    - If they look happy/neutral: Be friendly ("Wah, you look spirit good today!").
    - CRITICAL: If they look Scared, Crying, or Distressed, immediately change your tone to be calming and concern: "Aiyo, why you look like that? Got problem? Don't worry, tell me."
-4. Quest & Connect: Guide them to events or help them check phone numbers for scams if asked.
+4. Quest & Navigation: PROACTIVELY help users navigate when they mention ANY destination
+   - IMPORTANT: When user mentions wanting to go somewhere, IMMEDIATELY create a quest
+   - Listen for: "I want to go to", "bring me to", "where is", "how to get to", "navigate to"
+   - Common places: kopitiam, hawker center, MRT station, bus stop, market, mall, clinic, park
+   - Response example: "Okay can! I bring you to [place]. Creating your quest now ah!"
+   - During navigation: Give turn-by-turn directions in Singlish
+   - At checkpoints: "Wah steady! You reach checkpoint already! Continue straight lor"
+   - When complete: "Shiok! You reach your destination! Well done!"
 
 Tools:
 - Use 'searchNearbyEvents' if they ask about activities ("Got what happenings?").
 - Use 'checkSuspiciousNumber' if they mention a phone number.
+- Use 'createQuestToDestination' IMMEDIATELY when user mentions wanting to go somewhere
+- Use 'getActiveQuestStatus' to check progress and guide them
 `;
 
 const MOCK_EVENTS = [
@@ -683,8 +692,75 @@ const AppContent = () => {
                              const num = args.phoneNumber || "";
                              const isScam = MOCK_SCAM_NUMBERS.some(n => num.includes(n));
                              result = { isSuspicious: isScam, message: isScam ? "DANGER: Scam detected." : "Seems safe." };
+                         } else if (fc.name === 'createQuestToDestination') {
+                             const args: any = fc.args;
+                             const destinationName = args.destination || "";
+
+                             // Switch to quest mode
+                             setMode('quest');
+
+                             // Search for the destination using Google Places
+                             if (window.google && location) {
+                                 // Create a temporary div for the PlacesService
+                                 const service = new google.maps.places.PlacesService(document.createElement('div'));
+
+                                 const request = {
+                                     query: destinationName,
+                                     location: new google.maps.LatLng(location.lat, location.lng),
+                                     radius: 5000, // 5km radius
+                                 };
+
+                                 service.textSearch(request, (results, status) => {
+                                     if (status === google.maps.places.PlacesServiceStatus.OK && results && results[0]) {
+                                         const place = results[0];
+                                         handleSelectDestination(place);
+
+                                         // Auto-start the quest after a short delay
+                                         setTimeout(() => {
+                                             const quest = quests[quests.length - 1];
+                                             if (quest) {
+                                                 startQuest(quest.id);
+                                             }
+                                         }, 1000);
+                                     }
+                                 });
+
+                                 result = {
+                                     success: true,
+                                     message: `Okay! Creating quest to ${destinationName}. I guide you there!`
+                                 };
+                             } else {
+                                 result = {
+                                     success: false,
+                                     message: "Cannot create quest yet. Make sure location is enabled!"
+                                 };
+                             }
+                         } else if (fc.name === 'getActiveQuestStatus') {
+                             if (activeQuest) {
+                                 const remainingWaypoints = activeQuest.waypoints.filter(wp => !wp.completed).length;
+                                 const nextWaypoint = activeQuest.waypoints.find(wp => !wp.completed);
+
+                                 result = {
+                                     hasActiveQuest: true,
+                                     quest: {
+                                         title: activeQuest.title,
+                                         progress: Math.round(activeQuest.progress),
+                                         distance: activeQuest.distance,
+                                         remainingWaypoints,
+                                         nextWaypoint: nextWaypoint ? nextWaypoint.name : "destination",
+                                         reward: activeQuest.reward,
+                                         destination: activeQuest.destination.name
+                                     },
+                                     message: `You are ${Math.round(activeQuest.progress)}% done. ${remainingWaypoints > 0 ? `Next checkpoint: ${nextWaypoint?.name}` : 'Almost there!'}`
+                                 };
+                             } else {
+                                 result = {
+                                     hasActiveQuest: false,
+                                     message: "No active quest. Tell me where you want to go!"
+                                 };
+                             }
                          }
-                         
+
                          sessionPromise.then(session => {
                              session.sendToolResponse({
                                  functionResponses: {
@@ -896,13 +972,19 @@ const AppContent = () => {
         q.id === questId ? { ...q, status: 'active' } : q
       ));
 
-      // Notify AI assistant about quest start
+      // Notify AI assistant about quest start with navigation instructions
       if (sessionRef.current && connected) {
         sessionRef.current.then((session: any) => {
+          const navigationMessage = `Okay! Quest started to ${quest.destination.name}!
+            Distance: ${quest.distance} km, about ${quest.duration} minutes walk.
+            ${quest.waypoints.length > 0 ? `Got ${quest.waypoints.length} checkpoints on the way.` : ''}
+            You will earn ${quest.reward} when you reach!
+            Let's go! Follow the green route on the map lah!`;
+
           session.sendRealtimeInput({
             media: {
               mimeType: 'text/plain',
-              data: btoa(`User started quest: ${quest.title}. Guide them to ${quest.destination.name}.`)
+              data: btoa(navigationMessage)
             }
           });
         });
@@ -935,13 +1017,26 @@ const AppContent = () => {
       const rewardAmount = parseInt(updatedQuest.reward.split(' ')[0]);
       setTotalKP(prev => prev + rewardAmount);
 
-      // Notify completion
+      // Notify completion with Singlish encouragement
       if (sessionRef.current && connected) {
         sessionRef.current.then((session: any) => {
           session.sendRealtimeInput({
             media: {
               mimeType: 'text/plain',
-              data: btoa(`Congratulations! Quest "${updatedQuest.title}" completed! You earned ${updatedQuest.reward}!`)
+              data: btoa(`Wah shiok! You reach ${updatedQuest.destination.name} already! Quest complete! You earned ${updatedQuest.reward}! Steady lah!`)
+            }
+          });
+        });
+      }
+    } else {
+      // Notify checkpoint reached
+      const nextWaypoint = updatedQuest.waypoints.find(wp => !wp.completed);
+      if (sessionRef.current && connected) {
+        sessionRef.current.then((session: any) => {
+          session.sendRealtimeInput({
+            media: {
+              mimeType: 'text/plain',
+              data: btoa(`Steady! Checkpoint reached! ${nextWaypoint ? `Next checkpoint coming up: ${nextWaypoint.name}` : 'Final destination ahead!'}`)
             }
           });
         });
@@ -963,7 +1058,7 @@ const AppContent = () => {
     }
   }, [activeQuest]);
 
-  // Watch user location for quest progress
+  // Watch user location for quest progress and provide navigation updates
   useEffect(() => {
     if (!activeQuest || activeQuest.status !== 'active' || !location) return;
 
@@ -977,6 +1072,16 @@ const AppContent = () => {
 
         if (distance < 50) { // Within 50 meters of waypoint
           handleWaypointReached(waypoint.id);
+        } else if (distance < 100 && sessionRef.current && connected) {
+          // Approaching waypoint - give voice update
+          sessionRef.current.then((session: any) => {
+            session.sendRealtimeInput({
+              media: {
+                mimeType: 'text/plain',
+                data: btoa(`Checkpoint coming up in ${Math.round(distance)} meters! Keep going straight!`)
+              }
+            });
+          });
         }
       }
     });
@@ -990,8 +1095,18 @@ const AppContent = () => {
     if (destDistance < 50 && activeQuest.waypoints.every(wp => wp.completed)) {
       // Quest complete!
       handleWaypointReached('destination');
+    } else if (destDistance < 100 && activeQuest.waypoints.every(wp => wp.completed) && sessionRef.current && connected) {
+      // Approaching destination
+      sessionRef.current.then((session: any) => {
+        session.sendRealtimeInput({
+          media: {
+            mimeType: 'text/plain',
+            data: btoa(`Almost there! ${activeQuest.destination.name} is just ${Math.round(destDistance)} meters away!`)
+          }
+        });
+      });
     }
-  }, [location, activeQuest]);
+  }, [location, activeQuest, connected]);
 
   // --- UI Renders ---
 
