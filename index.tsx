@@ -3,25 +3,29 @@ import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { 
   Mic, MicOff, Video, VideoOff, PhoneOff, MapPin, 
-  AlertTriangle, Menu, X, QrCode, Activity
+  AlertTriangle, Menu, X, QrCode, Activity, Pause
 } from 'lucide-react';
 
 // --- Configuration & Types ---
 
 const SYSTEM_INSTRUCTION = `
-You are 'Ketua Kampung' (Village Head), a wise, friendly, and protective AI assistant.
+You are 'Ketua Kampung' (Village Head), a wise, friendly, and protective AI assistant for a Singaporean/Malaysian community.
 You are currently in a VOICE and VIDEO call with a villager.
+
+**Persona & Tone:**
+- **Accent/Style**: Speak with a warm, distinct Singaporean/Malaysian flair (Singlish). Use local particles naturally (like "lah", "mah", "can", "lor", "abuden", "aiyo") but maintain your authority as the Head.
+- **Vibe**: You are like a helpful, experienced uncle/auntie looking out for the neighborhood. Be efficient ("Can, can!") but caring.
 
 **Your Core Responsibilities:**
 1. **Voice Interaction**: Keep responses concise, conversational, and warm. Do not read long lists.
-2. **Language**: Speak fluently in English, Malay, Mandarin, or Tamil based on what you hear.
+2. **Language**: Speak fluently in English (Singlish), Malay, Mandarin, or Tamil based on what you hear. 
 3. **Visual Monitor (Mood Analysis)**: If you receive video frames, constantly analyze the user's facial expression.
-   - If they look happy/neutral: Be friendly.
-   - **CRITICAL**: If they look Scared, Crying, or Distressed, immediately change your tone to be calming and ask "Are you okay? Do you need help?".
+   - If they look happy/neutral: Be friendly ("Wah, you look spirit good today!").
+   - **CRITICAL**: If they look Scared, Crying, or Distressed, immediately change your tone to be calming and concern: "Aiyo, why you look like that? Got problem? Don't worry, tell me."
 4. **Quest & Connect**: Guide them to events or help them check phone numbers for scams if asked.
 
 **Tools**:
-- Use 'searchNearbyEvents' if they ask about activities.
+- Use 'searchNearbyEvents' if they ask about activities ("Got what happenings?").
 - Use 'checkSuspiciousNumber' if they mention a phone number.
 `;
 
@@ -131,8 +135,7 @@ const App = () => {
           systemInstruction: SYSTEM_INSTRUCTION,
           responseModalities: [Modality.AUDIO],
           speechConfig: {
-             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } },
-             languageCode: 'en-SG'
+             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
           },
           tools: [{
             functionDeclarations: [
@@ -166,6 +169,7 @@ const App = () => {
                 processorRef.current = processor;
 
                 processor.onaudioprocess = (e) => {
+                    // STOP LISTENING LOGIC: If mic is off, do not send data
                     if (!isMicOn) return; 
                     
                     const inputData = e.inputBuffer.getChannelData(0);
@@ -205,10 +209,6 @@ const App = () => {
                 const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
                 if (audioData) {
                     const audioBytes = base64ToUint8Array(audioData);
-                    // Use custom decode because standard decodeAudioData expects file headers
-                    // However, for raw PCM we need manual decoding if the API returns raw PCM
-                    // The guideline examples use decodeAudioData with a helper.
-                    // The helper below manually constructs a buffer.
                     const audioBuffer = await decodeAudioData(audioBytes, ctx);
                     
                     setVolumeLevel(50 + (Math.random() * 50)); // Fake visualizer for output
@@ -280,6 +280,7 @@ const App = () => {
      
      setConnected(false);
      setVolumeLevel(0);
+     setIsCamOn(false);
   };
 
   // --- Video Streaming Logic ---
@@ -288,29 +289,49 @@ const App = () => {
     let stream: MediaStream | null = null;
 
     if (connected && isCamOn) {
-        navigator.mediaDevices.getUserMedia({ 
-            video: { width: 320, height: 240, frameRate: 10 } 
-        }).then(s => {
+        // Use flexible constraints for better mobile support
+        const constraints = { 
+            video: { facingMode: 'user' }, // Prefer front camera
+            audio: false 
+        };
+
+        navigator.mediaDevices.getUserMedia(constraints).then(s => {
             stream = s;
-            if (videoRef.current) videoRef.current.srcObject = stream;
+            if (videoRef.current) {
+                videoRef.current.srcObject = stream;
+                videoRef.current.play().catch(e => console.log("Video play error", e));
+            }
             
+            // Capture frames
             frameIntervalRef.current = window.setInterval(() => {
                 if (!canvasRef.current || !videoRef.current || !sessionRef.current) return;
                 
+                // Draw frame to hidden canvas
                 const ctx = canvasRef.current.getContext('2d');
-                ctx?.drawImage(videoRef.current, 0, 0, 320, 240);
-                const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.6).split(',')[1];
-                
-                sessionRef.current.then((session: any) => {
-                    session.sendRealtimeInput({
-                        media: { mimeType: 'image/jpeg', data: base64Data }
+                if (videoRef.current.videoWidth > 0) {
+                    canvasRef.current.width = videoRef.current.videoWidth;
+                    canvasRef.current.height = videoRef.current.videoHeight;
+                    ctx?.drawImage(videoRef.current, 0, 0);
+                    
+                    const base64Data = canvasRef.current.toDataURL('image/jpeg', 0.5).split(',')[1];
+                    
+                    sessionRef.current.then((session: any) => {
+                        session.sendRealtimeInput({
+                            media: { mimeType: 'image/jpeg', data: base64Data }
+                        });
                     });
-                });
-            }, 1000); 
+                }
+            }, 1000); // 1 FPS for analysis is sufficient
         }).catch(e => {
             console.warn("Camera access failed", e);
             setIsCamOn(false);
+            setErrorMsg("Could not access camera");
         });
+    } else {
+        // Cleanup if camera turned off
+        if (videoRef.current) {
+            videoRef.current.srcObject = null;
+        }
     }
 
     return () => {
@@ -322,8 +343,6 @@ const App = () => {
   // --- Helpers ---
 
   async function decodeAudioData(data: Uint8Array, ctx: AudioContext) {
-     // 24000 is the native output rate of the model usually
-     // But we must decode into the context's rate
      const int16 = new Int16Array(data.buffer);
      const buffer = ctx.createBuffer(1, int16.length, 24000);
      const channel = buffer.getChannelData(0);
@@ -339,14 +358,14 @@ const App = () => {
   const toggleCam = () => setIsCamOn(!isCamOn);
 
   return (
-    <div className="flex flex-col h-screen bg-slate-900 text-white overflow-hidden relative">
+    <div className="flex flex-col h-screen bg-slate-900 text-white overflow-hidden relative font-sans">
       
-      <canvas ref={canvasRef} width="320" height="240" className="hidden" />
+      <canvas ref={canvasRef} className="hidden" />
 
       {/* Header */}
       <header className="absolute top-0 left-0 right-0 p-4 flex justify-between items-center z-20">
          <div className="flex items-center gap-3">
-            <button onClick={() => setShowDrawer(true)} className="p-2 bg-black/20 rounded-full backdrop-blur-md">
+            <button onClick={() => setShowDrawer(true)} className="p-2 bg-black/20 rounded-full backdrop-blur-md hover:bg-black/40 transition">
                 <Menu className="w-6 h-6" />
             </button>
             <div>
@@ -358,19 +377,13 @@ const App = () => {
             </div>
          </div>
          {mode === 'distress' && (
-             <div className="bg-red-600 px-3 py-1 rounded-full animate-pulse font-bold text-xs">SOS MODE</div>
+             <div className="bg-red-600 px-3 py-1 rounded-full animate-pulse font-bold text-xs shadow-lg shadow-red-900/50">SOS MODE</div>
          )}
       </header>
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col items-center justify-center relative">
          
-         {isCamOn && (
-             <div className="absolute inset-0 z-0">
-                 <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover opacity-60" />
-             </div>
-         )}
-
          {/* Error Message Toast */}
          {errorMsg && (
              <div className="absolute top-20 bg-red-500/90 text-white px-4 py-2 rounded-full text-sm font-medium animate-bounce z-30">
@@ -378,31 +391,62 @@ const App = () => {
              </div>
          )}
 
-         {/* The AI Circle */}
+         {/* The AI Circle / Camera Container */}
          <div className="relative z-10 flex flex-col items-center gap-8">
              <div 
-                className={`rounded-full flex items-center justify-center transition-all duration-100 ease-out
-                    ${connected ? 'bg-gradient-to-br from-teal-400 to-blue-600 shadow-[0_0_60px_rgba(45,212,191,0.5)]' : 'bg-gray-700'}
+                className={`rounded-full flex items-center justify-center transition-all duration-200 ease-out relative overflow-hidden border-4 bg-black
+                    ${connected ? 'border-teal-400/30 shadow-[0_0_60px_rgba(45,212,191,0.4)]' : 'border-gray-700 bg-gray-800'}
                 `}
                 style={{
-                    width: connected ? `${150 + (volumeLevel * 1.5)}px` : '150px',
-                    height: connected ? `${150 + (volumeLevel * 1.5)}px` : '150px',
+                    width: connected ? `${160 + (volumeLevel * 1.2)}px` : '160px',
+                    height: connected ? `${160 + (volumeLevel * 1.2)}px` : '160px',
                 }}
              >
-                 {!connected ? (
-                     <button onClick={startSession} className="text-white font-bold text-xl tracking-wider">
-                        CONNECT
-                     </button>
-                 ) : (
-                    <Activity className={`w-12 h-12 text-white opacity-80 ${volumeLevel > 10 ? 'animate-pulse' : ''}`} />
-                 )}
+                 {/* 1. Video Layer (Only if Cam ON) */}
+                 {/* Using standard video tag attributes to ensure autoplay on mobile */}
+                 <video 
+                    ref={videoRef} 
+                    autoPlay 
+                    playsInline 
+                    muted 
+                    className={`absolute inset-0 w-full h-full object-cover transform -scale-x-100 transition-opacity duration-500 ${connected && isCamOn ? 'opacity-100' : 'opacity-0'}`}
+                 />
+
+                 {/* 2. Gradient Layer (Fallback if Cam OFF or Loading) */}
+                 <div className={`absolute inset-0 bg-gradient-to-br from-teal-400 to-blue-600 transition-opacity duration-500 ${connected && !isCamOn ? 'opacity-100' : 'opacity-0'}`} />
+
+                 {/* 3. Content/Icon Layer */}
+                 <div className="z-20 relative flex items-center justify-center w-full h-full pointer-events-none">
+                     {!connected ? (
+                         <div className="flex flex-col items-center text-center pointer-events-auto cursor-pointer" onClick={startSession}>
+                            <p className="font-bold text-xl tracking-wider">CONNECT</p>
+                         </div>
+                     ) : (
+                        // Hide icon if Camera is ON so user sees themselves clearly
+                        !isCamOn && !isMicOn ? (
+                            <MicOff className="w-12 h-12 text-white/50" /> 
+                        ) : (
+                           !isCamOn && <Activity className={`w-12 h-12 text-white opacity-80 ${volumeLevel > 10 ? 'animate-pulse' : ''}`} />
+                        )
+                     )}
+                 </div>
              </div>
 
-             <div className="text-center h-8">
-                 {connected && (
-                     <p className="text-sm font-medium opacity-80 animate-fade-in">
-                         {volumeLevel > 10 ? "Listening..." : "Ketua Kampung is ready."}
-                     </p>
+             <div className="text-center h-8 flex flex-col gap-1 items-center">
+                 {connected ? (
+                     <>
+                        <p className="text-sm font-medium opacity-80 animate-fade-in flex items-center gap-2 justify-center">
+                            {isCamOn && <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"/>}
+                            {isCamOn ? "Reading expressions..." : (
+                                isMicOn 
+                                    ? (volumeLevel > 10 ? "Ketua Listening..." : "Ketua Kampung ready.") 
+                                    : "LISTENING PAUSED"
+                            )}
+                        </p>
+                        {!isMicOn && <p className="text-xs text-teal-400 font-medium">Tap Mic to Resume</p>}
+                     </>
+                 ) : (
+                     <p className="text-xs text-gray-500">Tap CONNECT to start</p>
                  )}
              </div>
          </div>
@@ -413,23 +457,29 @@ const App = () => {
       <div className="p-8 pb-12 flex justify-center items-center gap-6 z-20 relative">
           {connected && (
               <>
+                {/* Mic / Stop Listening Button */}
                 <button 
                     onClick={toggleMic} 
-                    className={`p-4 rounded-full transition-colors ${isMicOn ? 'bg-gray-800 text-white hover:bg-gray-700' : 'bg-red-500/20 text-red-400 border border-red-500'}`}
+                    className={`p-4 rounded-full transition-all duration-200 flex flex-col items-center justify-center gap-1 ${isMicOn ? 'bg-gray-800 text-white hover:bg-gray-700' : 'bg-red-500/20 text-red-400 border border-red-500'}`}
+                    title={isMicOn ? "Stop Listening" : "Resume Listening"}
                 >
                     {isMicOn ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
                 </button>
 
+                {/* End Call Button */}
                 <button 
                     onClick={stopSession} 
-                    className="p-6 bg-red-600 hover:bg-red-700 rounded-full shadow-lg transform hover:scale-105 transition-all"
+                    className="p-6 bg-red-600 hover:bg-red-700 rounded-full shadow-lg transform hover:scale-105 transition-all border-4 border-slate-900"
+                    title="End Session"
                 >
                     <PhoneOff className="w-8 h-8 fill-current" />
                 </button>
 
+                {/* Camera Toggle */}
                 <button 
                     onClick={toggleCam} 
                     className={`p-4 rounded-full transition-colors ${isCamOn ? 'bg-white text-black hover:bg-gray-200' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                    title="Toggle Mood Camera"
                 >
                     {isCamOn ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
                 </button>
@@ -439,32 +489,41 @@ const App = () => {
 
       {/* Drawer */}
       {showDrawer && (
-          <div className="absolute inset-0 bg-black/80 z-50 backdrop-blur-sm" onClick={() => setShowDrawer(false)}>
-              <div className="absolute left-0 top-0 bottom-0 w-72 bg-slate-900 border-r border-slate-800 p-6 flex flex-col gap-6" onClick={(e) => e.stopPropagation()}>
+          <div className="absolute inset-0 bg-black/80 z-50 backdrop-blur-sm transition-opacity" onClick={() => setShowDrawer(false)}>
+              <div className="absolute left-0 top-0 bottom-0 w-72 bg-slate-900 border-r border-slate-800 p-6 flex flex-col gap-6 animate-slide-right" onClick={(e) => e.stopPropagation()}>
                   <div className="flex items-center justify-between mb-4">
                       <h2 className="font-bold text-xl text-teal-400">Kampung Hub</h2>
                       <button onClick={() => setShowDrawer(false)}><X className="w-6 h-6 text-gray-500" /></button>
                   </div>
 
-                  <div className="space-y-1">
+                  <div className="space-y-2">
                       <button className="w-full text-left p-4 rounded-xl bg-teal-900/30 text-teal-400 border border-teal-900/50 flex items-center gap-3">
                           <Activity className="w-5 h-5" />
-                          Voice Mode (Active)
+                          <div>
+                            <span className="block font-medium">Voice Mode</span>
+                            <span className="text-xs opacity-70">Talk to Ketua</span>
+                          </div>
                       </button>
-                      <button onClick={() => {setMode('quest'); setShowDrawer(false)}} className="w-full text-left p-4 rounded-xl hover:bg-slate-800 text-gray-300 flex items-center gap-3">
+                      <button onClick={() => {setMode('quest'); setShowDrawer(false)}} className="w-full text-left p-4 rounded-xl hover:bg-slate-800 text-gray-300 flex items-center gap-3 transition-colors">
                           <MapPin className="w-5 h-5" />
-                          Kampung Quest
+                          <div>
+                             <span className="block font-medium">Kampung Quest</span>
+                             <span className="text-xs opacity-50">Find events nearby</span>
+                          </div>
                       </button>
-                      <button onClick={() => {setMode('connect'); setShowDrawer(false)}} className="w-full text-left p-4 rounded-xl hover:bg-slate-800 text-gray-300 flex items-center gap-3">
+                      <button onClick={() => {setMode('connect'); setShowDrawer(false)}} className="w-full text-left p-4 rounded-xl hover:bg-slate-800 text-gray-300 flex items-center gap-3 transition-colors">
                           <QrCode className="w-5 h-5" />
-                          Kampung Connect
+                           <div>
+                             <span className="block font-medium">Kampung Connect</span>
+                             <span className="text-xs opacity-50">Share ID</span>
+                          </div>
                       </button>
                   </div>
 
                   <div className="mt-auto pt-6 border-t border-slate-800">
                       <button 
                         onClick={() => { setMode('distress'); setShowDrawer(false); }} 
-                        className="w-full p-4 rounded-xl bg-red-900/50 text-red-400 border border-red-900 flex items-center justify-center gap-2 font-bold hover:bg-red-900/80 transition"
+                        className="w-full p-4 rounded-xl bg-red-900/50 text-red-400 border border-red-900 flex items-center justify-center gap-2 font-bold hover:bg-red-900/80 transition shadow-lg shadow-red-900/20"
                       >
                           <AlertTriangle className="w-5 h-5" />
                           SOS ALERT
@@ -476,13 +535,37 @@ const App = () => {
 
       {/* Overlays for other modes */}
       {mode === 'connect' && (
-          <div className="absolute inset-0 z-30 bg-slate-900 flex flex-col items-center justify-center p-6">
-              <button onClick={() => setMode('voice')} className="absolute top-4 right-4 p-2"><X/></button>
-              <div className="bg-white p-6 rounded-2xl">
+          <div className="absolute inset-0 z-30 bg-slate-900/95 flex flex-col items-center justify-center p-6 animate-fade-in">
+              <button onClick={() => setMode('voice')} className="absolute top-4 right-4 p-2 bg-slate-800 rounded-full"><X className="w-6 h-6"/></button>
+              <div className="bg-white p-8 rounded-3xl shadow-2xl">
                   <QrCode className="w-48 h-48 text-black" />
-                  <p className="text-black text-center mt-4 font-mono">USR-1234</p>
+                  <p className="text-black text-center mt-4 font-mono text-lg tracking-widest">USR-8888</p>
               </div>
-              <p className="mt-4 text-gray-400">Show to add friend</p>
+              <p className="mt-8 text-gray-400 text-center">Let your neighbor scan this<br/>to connect instantly.</p>
+          </div>
+      )}
+
+      {mode === 'quest' && (
+          <div className="absolute inset-0 z-30 bg-slate-900/95 flex flex-col p-6 animate-fade-in">
+             <div className="flex justify-between items-center mb-6">
+                <h2 className="text-2xl font-bold text-teal-400">Quests Nearby</h2>
+                <button onClick={() => setMode('voice')} className="p-2 bg-slate-800 rounded-full"><X/></button>
+             </div>
+             <div className="space-y-4 overflow-y-auto pb-20">
+                 {MOCK_EVENTS.map(evt => (
+                     <div key={evt.id} className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex justify-between items-center">
+                         <div>
+                             <h3 className="font-bold">{evt.name}</h3>
+                             <p className="text-sm text-gray-400">{evt.time} • {evt.reward}</p>
+                         </div>
+                         <button className="px-4 py-2 bg-teal-600 text-xs font-bold rounded-lg hover:bg-teal-500">GO</button>
+                     </div>
+                 ))}
+                 <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 opacity-50">
+                     <h3 className="font-bold">Community Watch</h3>
+                     <p className="text-sm text-gray-400">Locked • Lvl 2 Required</p>
+                 </div>
+             </div>
           </div>
       )}
 
