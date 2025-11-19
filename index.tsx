@@ -4,10 +4,14 @@ import { GoogleGenAI, Type, Modality } from "@google/genai";
 import {
   Mic, MicOff, Video, VideoOff, PhoneOff, MapPin,
   AlertTriangle, Menu, X, QrCode, Activity, Pause,
-  Navigation, Search, Target, Trophy, ChevronRight, Play, LogOut
+  Navigation, Search, Target, Trophy, ChevronRight, Play, LogOut,
+  UserPlus, Phone, Users, Copy, Check, PhoneIncoming, PhoneOutgoing
 } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
 import { AuthProvider, useAuth } from './src/contexts/AuthContext';
 import { Auth } from './src/components/Auth';
+import { getDatabase, ref, set, onValue, remove, push, onChildAdded } from 'firebase/database';
+import app from './src/firebase';
 
 // --- Configuration & Types ---
 
@@ -34,6 +38,28 @@ interface Waypoint {
   type: 'checkpoint' | 'task' | 'bonus';
   description?: string;
 }
+
+interface KampungConnection {
+  id: string;
+  name: string;
+  status: 'online' | 'offline' | 'busy';
+  lastSeen?: number;
+}
+
+interface CallState {
+  isInCall: boolean;
+  callType: 'incoming' | 'outgoing' | null;
+  remoteUserId: string | null;
+  remoteUserName: string | null;
+}
+
+// WebRTC Configuration
+const rtcConfig: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ]
+};
 
 const SYSTEM_INSTRUCTION = `
 You are 'Ketua Kampung' (Village Head), a wise, friendly, and protective AI assistant for a Singaporean/Malaysian community.
@@ -415,6 +441,19 @@ const AppContent = () => {
   const [selectedDestination, setSelectedDestination] = useState<google.maps.places.PlaceResult | null>(null);
   const [totalKP, setTotalKP] = useState(150); // User's Kampung Points
 
+  // Kampung Connect State
+  const [myUserId, setMyUserId] = useState<string>('');
+  const [connections, setConnections] = useState<KampungConnection[]>([]);
+  const [connectInput, setConnectInput] = useState('');
+  const [callState, setCallState] = useState<CallState>({
+    isInCall: false,
+    callType: null,
+    remoteUserId: null,
+    remoteUserName: null
+  });
+  const [copiedId, setCopiedId] = useState(false);
+  const [connectTab, setConnectTab] = useState<'share' | 'add' | 'friends'>('share');
+
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -424,6 +463,11 @@ const AppContent = () => {
   const sessionRef = useRef<any>(null);
   const frameIntervalRef = useRef<number | null>(null);
   const nextStartTimeRef = useRef<number>(0);
+
+  // WebRTC Refs
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement>(null);
 
   useEffect(() => {
     // Load Google Maps API
@@ -456,6 +500,284 @@ const AppContent = () => {
       );
     }
   }, []);
+
+  // --- Kampung Connect Initialization ---
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    // Generate or retrieve user ID from Firebase UID
+    const userId = `KP-${currentUser.uid.substring(0, 8).toUpperCase()}`;
+    setMyUserId(userId);
+
+    // Initialize Firebase Realtime Database for signaling
+    const db = getDatabase(app);
+
+    // Set user as online
+    const userStatusRef = ref(db, `users/${userId}`);
+    set(userStatusRef, {
+      name: currentUser.displayName || currentUser.email?.split('@')[0] || 'Villager',
+      status: 'online',
+      lastSeen: Date.now()
+    });
+
+    // Listen for incoming calls
+    const callsRef = ref(db, `calls/${userId}`);
+    const unsubscribeCalls = onValue(callsRef, async (snapshot) => {
+      const callData = snapshot.val();
+      if (callData && callData.type === 'offer') {
+        // Incoming call
+        setCallState({
+          isInCall: false,
+          callType: 'incoming',
+          remoteUserId: callData.from,
+          remoteUserName: callData.fromName
+        });
+      }
+    });
+
+    // Load saved connections from localStorage
+    const savedConnections = localStorage.getItem(`kampung_connections_${userId}`);
+    if (savedConnections) {
+      setConnections(JSON.parse(savedConnections));
+    }
+
+    // Cleanup on unmount
+    return () => {
+      unsubscribeCalls();
+      set(userStatusRef, {
+        status: 'offline',
+        lastSeen: Date.now()
+      });
+    };
+  }, [currentUser]);
+
+  // --- Kampung Connect Functions ---
+
+  const copyUserId = useCallback(() => {
+    navigator.clipboard.writeText(myUserId);
+    setCopiedId(true);
+    setTimeout(() => setCopiedId(false), 2000);
+  }, [myUserId]);
+
+  const addConnection = useCallback(async () => {
+    if (!connectInput.trim() || !currentUser) return;
+
+    const friendId = connectInput.trim().toUpperCase();
+    if (friendId === myUserId) {
+      setErrorMsg("Cannot add yourself!");
+      return;
+    }
+
+    // Check if already connected
+    if (connections.some(c => c.id === friendId)) {
+      setErrorMsg("Already connected!");
+      return;
+    }
+
+    // Check if user exists in Firebase
+    const db = getDatabase(app);
+    const userRef = ref(db, `users/${friendId}`);
+
+    onValue(userRef, (snapshot) => {
+      const userData = snapshot.val();
+      if (userData) {
+        const newConnection: KampungConnection = {
+          id: friendId,
+          name: userData.name || friendId,
+          status: userData.status || 'offline',
+          lastSeen: userData.lastSeen
+        };
+
+        const updatedConnections = [...connections, newConnection];
+        setConnections(updatedConnections);
+        localStorage.setItem(`kampung_connections_${myUserId}`, JSON.stringify(updatedConnections));
+        setConnectInput('');
+        setConnectTab('friends');
+      } else {
+        setErrorMsg("User not found!");
+      }
+    }, { onlyOnce: true });
+  }, [connectInput, connections, myUserId, currentUser]);
+
+  const initiateCall = useCallback(async (friendId: string, friendName: string) => {
+    if (!currentUser || callState.isInCall) return;
+
+    try {
+      // Get audio stream
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = stream;
+
+      // Create peer connection
+      const pc = new RTCPeerConnection(rtcConfig);
+      peerConnectionRef.current = pc;
+
+      // Add local stream
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+      // Handle remote stream
+      pc.ontrack = (event) => {
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = event.streams[0];
+        }
+      };
+
+      // Handle ICE candidates
+      const db = getDatabase(app);
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          const candidateRef = push(ref(db, `candidates/${friendId}`));
+          set(candidateRef, {
+            from: myUserId,
+            candidate: event.candidate.toJSON()
+          });
+        }
+      };
+
+      // Create and send offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const callRef = ref(db, `calls/${friendId}`);
+      await set(callRef, {
+        type: 'offer',
+        from: myUserId,
+        fromName: currentUser.displayName || currentUser.email?.split('@')[0] || 'Villager',
+        offer: { type: offer.type, sdp: offer.sdp }
+      });
+
+      setCallState({
+        isInCall: true,
+        callType: 'outgoing',
+        remoteUserId: friendId,
+        remoteUserName: friendName
+      });
+
+      // Listen for answer
+      onValue(ref(db, `calls/${myUserId}`), async (snapshot) => {
+        const data = snapshot.val();
+        if (data && data.type === 'answer' && pc.signalingState !== 'closed') {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        }
+      });
+
+      // Listen for ICE candidates
+      onChildAdded(ref(db, `candidates/${myUserId}`), async (snapshot) => {
+        const data = snapshot.val();
+        if (data && data.candidate && pc.signalingState !== 'closed') {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+      });
+
+    } catch (error) {
+      console.error('Call failed:', error);
+      setErrorMsg('Failed to start call');
+    }
+  }, [currentUser, myUserId, callState.isInCall]);
+
+  const acceptCall = useCallback(async () => {
+    if (!callState.remoteUserId || !currentUser) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = stream;
+
+      const pc = new RTCPeerConnection(rtcConfig);
+      peerConnectionRef.current = pc;
+
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+      pc.ontrack = (event) => {
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = event.streams[0];
+        }
+      };
+
+      const db = getDatabase(app);
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          const candidateRef = push(ref(db, `candidates/${callState.remoteUserId}`));
+          set(candidateRef, {
+            from: myUserId,
+            candidate: event.candidate.toJSON()
+          });
+        }
+      };
+
+      // Get offer from Firebase
+      const callRef = ref(db, `calls/${myUserId}`);
+      onValue(callRef, async (snapshot) => {
+        const data = snapshot.val();
+        if (data && data.offer && pc.signalingState !== 'closed') {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          // Send answer
+          await set(ref(db, `calls/${callState.remoteUserId}`), {
+            type: 'answer',
+            from: myUserId,
+            answer: { type: answer.type, sdp: answer.sdp }
+          });
+        }
+      }, { onlyOnce: true });
+
+      // Listen for ICE candidates
+      onChildAdded(ref(db, `candidates/${myUserId}`), async (snapshot) => {
+        const data = snapshot.val();
+        if (data && data.candidate && pc.signalingState !== 'closed') {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+      });
+
+      setCallState(prev => ({ ...prev, isInCall: true }));
+
+    } catch (error) {
+      console.error('Failed to accept call:', error);
+      setErrorMsg('Failed to accept call');
+    }
+  }, [callState.remoteUserId, myUserId, currentUser]);
+
+  const endCall = useCallback(() => {
+    // Close peer connection
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+
+    // Stop local stream
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+    }
+
+    // Clear Firebase call data
+    const db = getDatabase(app);
+    if (callState.remoteUserId) {
+      remove(ref(db, `calls/${callState.remoteUserId}`));
+      remove(ref(db, `candidates/${callState.remoteUserId}`));
+    }
+    remove(ref(db, `calls/${myUserId}`));
+    remove(ref(db, `candidates/${myUserId}`));
+
+    setCallState({
+      isInCall: false,
+      callType: null,
+      remoteUserId: null,
+      remoteUserName: null
+    });
+  }, [callState.remoteUserId, myUserId]);
+
+  const declineCall = useCallback(() => {
+    const db = getDatabase(app);
+    remove(ref(db, `calls/${myUserId}`));
+    setCallState({
+      isInCall: false,
+      callType: null,
+      remoteUserId: null,
+      remoteUserName: null
+    });
+  }, [myUserId]);
 
   // --- Live API Connection ---
 
@@ -664,7 +986,8 @@ const AppContent = () => {
                     setCurrentMood(detectedMood);
                 }
 
-                const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                const audioPart = msg.serverContent?.modelTurn?.parts?.find(part => part.inlineData?.data);
+                const audioData = audioPart?.inlineData?.data;
                 if (audioData) {
                     console.log('[DEBUG] Audio data received, length:', audioData.length);
                     const audioBytes = base64ToUint8Array(audioData);
@@ -1297,22 +1620,203 @@ const AppContent = () => {
                           Sign Out
                       </button>
                       <p className="text-xs text-center text-gray-500 truncate">
-                        {currentUser.email}
+                        {currentUser?.email}
                       </p>
                   </div>
               </div>
           </div>
       )}
 
+      {/* Hidden audio element for remote call audio */}
+      <audio ref={remoteAudioRef} autoPlay />
+
+      {/* Incoming Call Modal */}
+      {callState.callType === 'incoming' && !callState.isInCall && (
+          <div className="absolute inset-0 z-50 bg-black/80 flex items-center justify-center animate-fade-in">
+              <div className="bg-slate-800 rounded-3xl p-8 text-center max-w-sm mx-4">
+                  <PhoneIncoming className="w-16 h-16 text-green-400 mx-auto mb-4 animate-pulse" />
+                  <h3 className="text-xl font-bold text-white mb-2">Incoming Call</h3>
+                  <p className="text-gray-400 mb-6">{callState.remoteUserName || callState.remoteUserId}</p>
+                  <div className="flex gap-4 justify-center">
+                      <button
+                          onClick={declineCall}
+                          className="p-4 bg-red-600 rounded-full hover:bg-red-700 transition"
+                      >
+                          <PhoneOff className="w-6 h-6" />
+                      </button>
+                      <button
+                          onClick={acceptCall}
+                          className="p-4 bg-green-600 rounded-full hover:bg-green-700 transition"
+                      >
+                          <Phone className="w-6 h-6" />
+                      </button>
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* Active Call Overlay */}
+      {callState.isInCall && (
+          <div className="absolute inset-0 z-50 bg-slate-900 flex flex-col items-center justify-center animate-fade-in">
+              <div className="text-center">
+                  <div className="w-32 h-32 bg-teal-600 rounded-full flex items-center justify-center mx-auto mb-6">
+                      <Phone className="w-16 h-16 text-white animate-pulse" />
+                  </div>
+                  <h3 className="text-2xl font-bold text-white mb-2">
+                      {callState.callType === 'outgoing' ? 'Calling...' : 'In Call'}
+                  </h3>
+                  <p className="text-gray-400 mb-8">{callState.remoteUserName || callState.remoteUserId}</p>
+                  <button
+                      onClick={endCall}
+                      className="p-6 bg-red-600 rounded-full hover:bg-red-700 transition"
+                  >
+                      <PhoneOff className="w-8 h-8" />
+                  </button>
+              </div>
+          </div>
+      )}
+
       {/* Overlays for other modes */}
       {mode === 'connect' && (
-          <div className="absolute inset-0 z-30 bg-slate-900/95 flex flex-col items-center justify-center p-6 animate-fade-in">
-              <button onClick={() => setMode('voice')} className="absolute top-4 right-4 p-2 bg-slate-800 rounded-full"><X className="w-6 h-6"/></button>
-              <div className="bg-white p-8 rounded-3xl shadow-2xl">
-                  <QrCode className="w-48 h-48 text-black" />
-                  <p className="text-black text-center mt-4 font-mono text-lg tracking-widest">USR-8888</p>
+          <div className="absolute inset-0 z-30 bg-slate-900 flex flex-col animate-fade-in">
+              {/* Header */}
+              <div className="p-4 flex justify-between items-center border-b border-slate-800">
+                  <div className="flex items-center gap-3">
+                      <button onClick={() => setMode('voice')} className="p-2 bg-slate-800 rounded-full hover:bg-slate-700 transition">
+                          <X className="w-6 h-6" />
+                      </button>
+                      <div>
+                          <h2 className="text-xl font-bold text-teal-400">Kampung Connect</h2>
+                          <p className="text-xs text-gray-400">{connections.length} neighbors connected</p>
+                      </div>
+                  </div>
               </div>
-              <p className="mt-8 text-gray-400 text-center">Let your neighbor scan this<br/>to connect instantly.</p>
+
+              {/* Tabs */}
+              <div className="flex border-b border-slate-800">
+                  <button
+                      onClick={() => setConnectTab('share')}
+                      className={`flex-1 py-3 text-sm font-medium transition ${connectTab === 'share' ? 'text-teal-400 border-b-2 border-teal-400' : 'text-gray-400'}`}
+                  >
+                      Share ID
+                  </button>
+                  <button
+                      onClick={() => setConnectTab('add')}
+                      className={`flex-1 py-3 text-sm font-medium transition ${connectTab === 'add' ? 'text-teal-400 border-b-2 border-teal-400' : 'text-gray-400'}`}
+                  >
+                      Add Friend
+                  </button>
+                  <button
+                      onClick={() => setConnectTab('friends')}
+                      className={`flex-1 py-3 text-sm font-medium transition ${connectTab === 'friends' ? 'text-teal-400 border-b-2 border-teal-400' : 'text-gray-400'}`}
+                  >
+                      Friends
+                  </button>
+              </div>
+
+              {/* Content */}
+              <div className="flex-1 overflow-y-auto p-6">
+                  {/* Share ID Tab */}
+                  {connectTab === 'share' && (
+                      <div className="flex flex-col items-center">
+                          <div className="bg-white p-6 rounded-3xl shadow-2xl mb-6">
+                              <QRCodeSVG value={myUserId} size={200} level="H" />
+                          </div>
+                          <div className="flex items-center gap-2 mb-4">
+                              <p className="text-white font-mono text-xl tracking-widest">{myUserId}</p>
+                              <button
+                                  onClick={copyUserId}
+                                  className="p-2 bg-slate-800 rounded-lg hover:bg-slate-700 transition"
+                              >
+                                  {copiedId ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
+                              </button>
+                          </div>
+                          <p className="text-gray-400 text-center text-sm">
+                              Share this code with your neighbors to connect instantly!
+                          </p>
+                      </div>
+                  )}
+
+                  {/* Add Friend Tab */}
+                  {connectTab === 'add' && (
+                      <div className="max-w-md mx-auto">
+                          <div className="mb-6">
+                              <label className="block text-sm font-medium text-gray-400 mb-2">
+                                  Enter Friend's Kampung ID
+                              </label>
+                              <div className="flex gap-2">
+                                  <input
+                                      type="text"
+                                      value={connectInput}
+                                      onChange={(e) => setConnectInput(e.target.value)}
+                                      placeholder="KP-XXXXXXXX"
+                                      className="flex-1 px-4 py-3 bg-slate-800 border border-slate-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-teal-400"
+                                  />
+                                  <button
+                                      onClick={addConnection}
+                                      className="px-4 py-3 bg-teal-600 rounded-xl hover:bg-teal-500 transition"
+                                  >
+                                      <UserPlus className="w-5 h-5" />
+                                  </button>
+                              </div>
+                          </div>
+                          <p className="text-gray-400 text-center text-sm">
+                              Ask your neighbor for their Kampung ID or scan their QR code
+                          </p>
+                      </div>
+                  )}
+
+                  {/* Friends List Tab */}
+                  {connectTab === 'friends' && (
+                      <div className="space-y-3">
+                          {connections.length === 0 ? (
+                              <div className="text-center py-12">
+                                  <Users className="w-16 h-16 text-gray-600 mx-auto mb-4" />
+                                  <p className="text-gray-400">No neighbors connected yet</p>
+                                  <button
+                                      onClick={() => setConnectTab('add')}
+                                      className="mt-4 text-teal-400 text-sm hover:underline"
+                                  >
+                                      Add your first friend
+                                  </button>
+                              </div>
+                          ) : (
+                              connections.map(friend => (
+                                  <div
+                                      key={friend.id}
+                                      className="flex items-center justify-between p-4 bg-slate-800 rounded-xl"
+                                  >
+                                      <div className="flex items-center gap-3">
+                                          <div className="relative">
+                                              <div className="w-12 h-12 bg-teal-600 rounded-full flex items-center justify-center">
+                                                  <span className="text-lg font-bold">{friend.name[0].toUpperCase()}</span>
+                                              </div>
+                                              <div className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-slate-800 ${
+                                                  friend.status === 'online' ? 'bg-green-500' : 'bg-gray-500'
+                                              }`} />
+                                          </div>
+                                          <div>
+                                              <p className="font-medium text-white">{friend.name}</p>
+                                              <p className="text-xs text-gray-400">{friend.id}</p>
+                                          </div>
+                                      </div>
+                                      <button
+                                          onClick={() => initiateCall(friend.id, friend.name)}
+                                          disabled={friend.status !== 'online'}
+                                          className={`p-3 rounded-xl transition ${
+                                              friend.status === 'online'
+                                                  ? 'bg-green-600 hover:bg-green-500'
+                                                  : 'bg-gray-700 cursor-not-allowed'
+                                          }`}
+                                      >
+                                          <Phone className="w-5 h-5" />
+                                      </button>
+                                  </div>
+                              ))
+                          )}
+                      </div>
+                  )}
+              </div>
           </div>
       )}
 
