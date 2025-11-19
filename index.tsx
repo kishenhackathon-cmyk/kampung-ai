@@ -5,7 +5,9 @@ import {
   Mic, MicOff, Video, VideoOff, PhoneOff, MapPin,
   AlertTriangle, Menu, X, QrCode, Activity, Pause,
   Navigation, Search, Target, Trophy, ChevronRight, Play, LogOut,
-  UserPlus, Phone, Users, Copy, Check, PhoneIncoming, PhoneOutgoing
+  UserPlus, Phone, Users, Copy, Check, PhoneIncoming, PhoneOutgoing,
+  Camera, Image, Heart, Share2, Calendar, Clock, MapPinned,
+  Award, Sparkles, TrendingUp, Home
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { AuthProvider, useAuth } from './src/contexts/AuthContext';
@@ -14,6 +16,15 @@ import { getDatabase, ref, set, onValue, remove, push, onChildAdded } from 'fire
 import app from './src/firebase';
 
 // --- Configuration & Types ---
+
+interface CheckInPhoto {
+  id: string;
+  userId: string;
+  userName: string;
+  photoUrl: string;
+  timestamp: number;
+  location: { lat: number; lng: number };
+}
 
 interface Quest {
   id: string;
@@ -27,6 +38,7 @@ interface Quest {
   progress: number;
   status: 'active' | 'completed' | 'available';
   type: 'exploration' | 'community' | 'emergency' | 'fitness';
+  checkIns?: CheckInPhoto[];
 }
 
 interface Waypoint {
@@ -37,6 +49,23 @@ interface Waypoint {
   completed: boolean;
   type: 'checkpoint' | 'task' | 'bonus';
   description?: string;
+  checkIns?: CheckInPhoto[];
+}
+
+interface CommunityEvent {
+  id: string;
+  name: string;
+  description: string;
+  lat: number;
+  lng: number;
+  time: string;
+  date: string;
+  reward: string;
+  category: 'social' | 'fitness' | 'arts' | 'education' | 'food';
+  participants: string[];
+  maxParticipants?: number;
+  imageUrl?: string;
+  checkIns: CheckInPhoto[];
 }
 
 interface KampungConnection {
@@ -44,6 +73,7 @@ interface KampungConnection {
   name: string;
   status: 'online' | 'offline' | 'busy';
   lastSeen?: number;
+  kampungPoints?: number;
 }
 
 interface CallState {
@@ -95,9 +125,77 @@ Tools:
 - Use 'getActiveQuestStatus' to check progress and guide them
 `;
 
-const MOCK_EVENTS = [
-  { id: 'e1', name: 'Morning Tai Chi', lat: 1.3521, lng: 103.8198, time: '7:00 AM', reward: '50 KP' },
-  { id: 'e2', name: 'Pasar Malam Cleanup', lat: 1.3600, lng: 103.8200, time: '8:00 PM', reward: '100 KP' },
+const MOCK_COMMUNITY_EVENTS: CommunityEvent[] = [
+  {
+    id: 'e1',
+    name: 'Morning Tai Chi',
+    description: 'Join our daily morning exercise session at Capita Green, 138 Market Street. All levels welcome!',
+    lat: 1.2821,
+    lng: 103.8508,
+    time: '7:00 AM',
+    date: '2025-11-20',
+    reward: '50 KP',
+    category: 'fitness',
+    participants: [],
+    maxParticipants: 20,
+    checkIns: []
+  },
+  {
+    id: 'e2',
+    name: 'Pasar Malam Cleanup',
+    description: 'Help keep our night market clean and earn points!',
+    lat: 1.3600,
+    lng: 103.8200,
+    time: '8:00 PM',
+    date: '2025-11-20',
+    reward: '100 KP',
+    category: 'social',
+    participants: [],
+    maxParticipants: 15,
+    checkIns: []
+  },
+  {
+    id: 'e3',
+    name: 'Kopitiam Gathering',
+    description: 'Chat with neighbors over kopi and kaya toast!',
+    lat: 1.3550,
+    lng: 103.8210,
+    time: '3:00 PM',
+    date: '2025-11-20',
+    reward: '30 KP',
+    category: 'food',
+    participants: [],
+    maxParticipants: 25,
+    checkIns: []
+  },
+  {
+    id: 'e4',
+    name: 'Painting Workshop',
+    description: 'Learn watercolor painting with local artist Auntie Mei',
+    lat: 1.3580,
+    lng: 103.8190,
+    time: '10:00 AM',
+    date: '2025-11-21',
+    reward: '80 KP',
+    category: 'arts',
+    participants: [],
+    maxParticipants: 12,
+    checkIns: []
+  },
+  {
+    id: 'e5',
+    name: 'Smartphone Basics Class',
+    description: 'Learn to use your smartphone better. Bring your questions!',
+    lat: 1.3540,
+    lng: 103.8220,
+    time: '2:00 PM',
+    date: '2025-11-22',
+    reward: '60 KP',
+    category: 'education',
+    participants: [],
+    maxParticipants: 10,
+    checkIns: []
+  }
 ];
 
 const MOCK_SCAM_NUMBERS = ['99998888', '0123456789', '99999999'];
@@ -170,13 +268,19 @@ interface MapViewProps {
   onSelectDestination: (place: google.maps.places.PlaceResult) => void;
   activeQuest: Quest | null;
   onWaypointReached?: (waypointId: string) => void;
+  communityEvents?: CommunityEvent[];
+  onEventSelect?: (event: CommunityEvent) => void;
+  showEvents?: boolean;
 }
 
 const MapView: React.FC<MapViewProps> = ({
   userLocation,
   onSelectDestination,
   activeQuest,
-  onWaypointReached
+  onWaypointReached,
+  communityEvents = [],
+  onEventSelect,
+  showEvents = false
 }) => {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<google.maps.Map | null>(null);
@@ -184,6 +288,7 @@ const MapView: React.FC<MapViewProps> = ({
   const markersRef = useRef<google.maps.Marker[]>([]);
   const directionsRendererRef = useRef<google.maps.DirectionsRenderer | null>(null);
   const userMarkerRef = useRef<google.maps.Marker | null>(null);
+  const eventMarkersRef = useRef<google.maps.Marker[]>([]);
 
   useEffect(() => {
     if (!mapRef.current || !userLocation) return;
@@ -344,13 +449,96 @@ const MapView: React.FC<MapViewProps> = ({
     }
   }, [userLocation]);
 
+  // Render community event markers
+  useEffect(() => {
+    if (!mapInstanceRef.current || !showEvents) return;
+
+    // Clear existing event markers
+    eventMarkersRef.current.forEach(marker => marker.setMap(null));
+    eventMarkersRef.current = [];
+
+    // Get category colors and icons
+    const getCategoryStyle = (category: string) => {
+      switch (category) {
+        case 'fitness': return { color: '#10B981', icon: '🏃' };
+        case 'social': return { color: '#3B82F6', icon: '👥' };
+        case 'food': return { color: '#F59E0B', icon: '🍜' };
+        case 'arts': return { color: '#EC4899', icon: '🎨' };
+        case 'education': return { color: '#8B5CF6', icon: '📚' };
+        default: return { color: '#6B7280', icon: '📍' };
+      }
+    };
+
+    // Add markers for each event (LARGE for seniors)
+    communityEvents.forEach(event => {
+      const style = getCategoryStyle(event.category);
+
+      // Create custom HTML marker for better visibility
+      const markerDiv = document.createElement('div');
+      markerDiv.innerHTML = `
+        <div style="
+          background: ${style.color};
+          color: white;
+          padding: 12px 16px;
+          border-radius: 20px;
+          font-weight: bold;
+          font-size: 18px;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+          cursor: pointer;
+          transform: scale(1);
+          transition: transform 0.2s;
+          border: 3px solid white;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          min-width: 140px;
+        " onmouseover="this.style.transform='scale(1.1)'" onmouseout="this.style.transform='scale(1)'">
+          <span style="font-size: 24px;">${style.icon}</span>
+          <span>${event.name}</span>
+        </div>
+      `;
+
+      const marker = new google.maps.Marker({
+        position: { lat: event.lat, lng: event.lng },
+        map: mapInstanceRef.current!,
+        title: event.name,
+        icon: {
+          url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(`
+            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+              <circle cx="30" cy="30" r="28" fill="${style.color}" stroke="white" stroke-width="4"/>
+              <text x="30" y="38" font-size="28" text-anchor="middle" fill="white">${style.icon}</text>
+            </svg>
+          `),
+          scaledSize: new google.maps.Size(60, 60),
+          anchor: new google.maps.Point(30, 30)
+        },
+        label: {
+          text: event.name,
+          color: 'white',
+          fontSize: '14px',
+          fontWeight: 'bold'
+        },
+        animation: google.maps.Animation.DROP
+      });
+
+      marker.addListener('click', () => {
+        if (onEventSelect) {
+          onEventSelect(event);
+        }
+      });
+
+      eventMarkersRef.current.push(marker);
+    });
+  }, [communityEvents, showEvents, onEventSelect]);
+
   return (
     <div className="relative w-full h-full">
       <input
         ref={searchBoxRef}
         type="text"
         placeholder="Search for a destination..."
-        className="absolute top-4 left-4 z-10 px-4 py-3 rounded-xl bg-white text-gray-900 shadow-lg w-[calc(100%-2rem)] max-w-md"
+        className="absolute top-4 left-4 z-10 px-4 py-3 rounded-xl bg-white text-gray-900 shadow-lg w-[calc(100%-2rem)] max-w-md text-lg"
+        style={{ fontSize: '18px' }}
       />
       <div ref={mapRef} className="w-full h-full" />
     </div>
@@ -441,9 +629,70 @@ const AppContent = () => {
   const [selectedDestination, setSelectedDestination] = useState<google.maps.places.PlaceResult | null>(null);
   const [totalKP, setTotalKP] = useState(150); // User's Kampung Points
 
+  // Event & Photo State
+  const [communityEvents, setCommunityEvents] = useState<CommunityEvent[]>(MOCK_COMMUNITY_EVENTS);
+  const [selectedEvent, setSelectedEvent] = useState<CommunityEvent | null>(null);
+  const [showPhotoGallery, setShowPhotoGallery] = useState(false);
+  const [showCheckInCamera, setShowCheckInCamera] = useState(false);
+  const [capturedPhoto, setCapturedPhoto] = useState<string | null>(null);
+  const [checkInTarget, setCheckInTarget] = useState<{ type: 'event' | 'waypoint' | 'quest'; id: string } | null>(null);
+  const [questView, setQuestView] = useState<'map' | 'events' | 'dashboard'>('dashboard');
+  const [showQRScanner, setShowQRScanner] = useState(false);
+  const [qrScanResult, setQrScanResult] = useState<string | null>(null);
+
   // Kampung Connect State
-  const [myUserId, setMyUserId] = useState<string>('');
-  const [connections, setConnections] = useState<KampungConnection[]>([]);
+  const [myUserId, setMyUserId] = useState<string>(() => {
+    // Generate a persistent user ID even when not logged in
+    const stored = localStorage.getItem('kampung_user_id');
+    if (stored) return stored;
+    const newId = `KP-${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+    localStorage.setItem('kampung_user_id', newId);
+    return newId;
+  });
+  const [connections, setConnections] = useState<KampungConnection[]>([
+    {
+      id: 'KP-AH8G2K1L',
+      name: 'Auntie Mei',
+      status: 'online',
+      lastSeen: Date.now(),
+      kampungPoints: 2350
+    },
+    {
+      id: 'KP-TAN5H9M3',
+      name: 'Uncle Tan',
+      status: 'online',
+      lastSeen: Date.now(),
+      kampungPoints: 1820
+    },
+    {
+      id: 'KP-LIMS4R7P',
+      name: 'Mrs. Lim',
+      status: 'offline',
+      lastSeen: Date.now() - 3600000, // 1 hour ago
+      kampungPoints: 3150
+    },
+    {
+      id: 'KP-RAJK3N8D',
+      name: 'Mr. Raj',
+      status: 'online',
+      lastSeen: Date.now(),
+      kampungPoints: 1450
+    },
+    {
+      id: 'KP-CHENX2Q9',
+      name: 'Auntie Chen',
+      status: 'offline',
+      lastSeen: Date.now() - 7200000, // 2 hours ago
+      kampungPoints: 2890
+    },
+    {
+      id: 'KP-WONGP6T4',
+      name: 'Uncle Wong',
+      status: 'online',
+      lastSeen: Date.now(),
+      kampungPoints: 950
+    }
+  ]);
   const [connectInput, setConnectInput] = useState('');
   const [callState, setCallState] = useState<CallState>({
     isInCall: false,
@@ -463,6 +712,19 @@ const AppContent = () => {
   const sessionRef = useRef<any>(null);
   const frameIntervalRef = useRef<number | null>(null);
   const nextStartTimeRef = useRef<number>(0);
+
+  // Check-in camera refs
+  const checkInVideoRef = useRef<HTMLVideoElement>(null);
+  const checkInCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Video call refs
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+
+  // QR Scanner refs
+  const qrVideoRef = useRef<HTMLVideoElement>(null);
+  const qrCanvasRef = useRef<HTMLCanvasElement>(null);
+  const qrScanIntervalRef = useRef<number | null>(null);
 
   // WebRTC Refs
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -561,52 +823,63 @@ const AppContent = () => {
   }, [myUserId]);
 
   const addConnection = useCallback(async () => {
-    if (!connectInput.trim() || !currentUser) return;
+    if (!connectInput.trim()) return;
 
     const friendId = connectInput.trim().toUpperCase();
+
+    // Validate format
+    if (!friendId.startsWith('KP-')) {
+      setErrorMsg("Invalid Kampung ID format! Should start with KP-");
+      setTimeout(() => setErrorMsg(null), 3000);
+      return;
+    }
+
     if (friendId === myUserId) {
       setErrorMsg("Cannot add yourself!");
+      setTimeout(() => setErrorMsg(null), 3000);
       return;
     }
 
     // Check if already connected
     if (connections.some(c => c.id === friendId)) {
       setErrorMsg("Already connected!");
+      setTimeout(() => setErrorMsg(null), 3000);
       return;
     }
 
-    // Check if user exists in Firebase
-    const db = getDatabase(app);
-    const userRef = ref(db, `users/${friendId}`);
+    // Add the friend (works without authentication)
+    const newConnection: KampungConnection = {
+      id: friendId,
+      name: `Friend ${friendId.substring(3, 6)}`, // Generate a name from ID
+      status: Math.random() > 0.5 ? 'online' : 'offline', // Random status
+      lastSeen: Date.now()
+    };
 
-    onValue(userRef, (snapshot) => {
-      const userData = snapshot.val();
-      if (userData) {
-        const newConnection: KampungConnection = {
-          id: friendId,
-          name: userData.name || friendId,
-          status: userData.status || 'offline',
-          lastSeen: userData.lastSeen
-        };
+    const updatedConnections = [...connections, newConnection];
+    setConnections(updatedConnections);
+    localStorage.setItem(`kampung_connections_${myUserId}`, JSON.stringify(updatedConnections));
+    setConnectInput('');
+    setConnectTab('friends');
 
-        const updatedConnections = [...connections, newConnection];
-        setConnections(updatedConnections);
-        localStorage.setItem(`kampung_connections_${myUserId}`, JSON.stringify(updatedConnections));
-        setConnectInput('');
-        setConnectTab('friends');
-      } else {
-        setErrorMsg("User not found!");
-      }
-    }, { onlyOnce: true });
-  }, [connectInput, connections, myUserId, currentUser]);
+    // Show success message
+    console.log(`Added friend: ${friendId}`);
+  }, [connectInput, connections, myUserId]);
 
   const initiateCall = useCallback(async (friendId: string, friendName: string) => {
     if (!currentUser || callState.isInCall) return;
 
     try {
-      // Get audio stream
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Get audio and video stream
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
       localStreamRef.current = stream;
+
+      // Attach local stream to video element
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
 
       // Create peer connection
       const pc = new RTCPeerConnection(rtcConfig);
@@ -617,6 +890,10 @@ const AppContent = () => {
 
       // Handle remote stream
       pc.ontrack = (event) => {
+        console.log('Received remote track:', event.track.kind);
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
         if (remoteAudioRef.current) {
           remoteAudioRef.current.srcObject = event.streams[0];
         }
@@ -679,8 +956,16 @@ const AppContent = () => {
     if (!callState.remoteUserId || !currentUser) return;
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
       localStreamRef.current = stream;
+
+      // Attach local stream to video element
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
 
       const pc = new RTCPeerConnection(rtcConfig);
       peerConnectionRef.current = pc;
@@ -688,6 +973,10 @@ const AppContent = () => {
       stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
       pc.ontrack = (event) => {
+        console.log('Received remote track:', event.track.kind);
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
         if (remoteAudioRef.current) {
           remoteAudioRef.current.srcObject = event.streams[0];
         }
@@ -1222,6 +1511,287 @@ const AppContent = () => {
     }
   }, [activeQuest]);
 
+  // --- Event Management Functions ---
+
+  const joinEvent = useCallback((eventId: string) => {
+    if (!myUserId) return;
+
+    setCommunityEvents(prev => prev.map(event => {
+      if (event.id === eventId) {
+        if (event.participants.includes(myUserId)) {
+          // Already joined
+          return event;
+        }
+        if (event.maxParticipants && event.participants.length >= event.maxParticipants) {
+          setErrorMsg("Event is full!");
+          return event;
+        }
+        return {
+          ...event,
+          participants: [...event.participants, myUserId]
+        };
+      }
+      return event;
+    }));
+
+    // Award points for joining
+    setTotalKP(prev => prev + 10);
+  }, [myUserId]);
+
+  const leaveEvent = useCallback((eventId: string) => {
+    if (!myUserId) return;
+
+    setCommunityEvents(prev => prev.map(event => {
+      if (event.id === eventId) {
+        return {
+          ...event,
+          participants: event.participants.filter(id => id !== myUserId)
+        };
+      }
+      return event;
+    }));
+  }, [myUserId]);
+
+  const navigateToEvent = useCallback((event: CommunityEvent) => {
+    if (!location) {
+      setErrorMsg("Location not available. Please enable location access.");
+      return;
+    }
+
+    // Switch to map view
+    setQuestView('map');
+
+    // Extract address from description if available
+    let formattedAddress = event.description;
+    if (event.id === 'e1') {
+      formattedAddress = '138 Market Street, Singapore';
+    }
+
+    // Create a mock PlaceResult for the event location
+    const mockPlace: google.maps.places.PlaceResult = {
+      name: event.name,
+      geometry: {
+        location: new google.maps.LatLng(event.lat, event.lng)
+      } as google.maps.places.PlaceGeometry,
+      formatted_address: formattedAddress,
+      types: [event.category],
+      place_id: `event-${event.id}`
+    };
+
+    // Create the quest
+    const newQuest = generateQuestFromDestination(mockPlace, location);
+    setQuests(prev => [...prev, newQuest]);
+
+    // Automatically start the quest to show directions
+    setTimeout(() => {
+      setActiveQuest({ ...newQuest, status: 'active' });
+      setSelectedDestination(null);
+    }, 100);
+  }, [location]);
+
+  // --- Photo Check-In Functions ---
+
+  const openCheckInCamera = useCallback((target: { type: 'event' | 'waypoint' | 'quest'; id: string }) => {
+    setCheckInTarget(target);
+    setShowCheckInCamera(true);
+  }, []);
+
+  const captureCheckInPhoto = useCallback(async () => {
+    if (!checkInVideoRef.current || !checkInCanvasRef.current) return;
+
+    const canvas = checkInCanvasRef.current;
+    const video = checkInVideoRef.current;
+
+    if (video.readyState === 4) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      ctx?.drawImage(video, 0, 0);
+
+      const photoData = canvas.toDataURL('image/jpeg', 0.8);
+      setCapturedPhoto(photoData);
+    }
+  }, []);
+
+  const submitCheckIn = useCallback(async () => {
+    if (!capturedPhoto || !checkInTarget || !location) return;
+
+    const checkIn: CheckInPhoto = {
+      id: `checkin-${Date.now()}`,
+      userId: myUserId,
+      userName: currentUser?.displayName || currentUser?.email?.split('@')[0] || myUserId || 'Villager',
+      photoUrl: capturedPhoto,
+      timestamp: Date.now(),
+      location: location
+    };
+
+    // Add check-in to the appropriate target
+    if (checkInTarget.type === 'event') {
+      setCommunityEvents(prev => prev.map(event => {
+        if (event.id === checkInTarget.id) {
+          return {
+            ...event,
+            checkIns: [...event.checkIns, checkIn]
+          };
+        }
+        return event;
+      }));
+      // Award points for event check-in
+      setTotalKP(prev => prev + 20);
+    } else if (checkInTarget.type === 'waypoint' && activeQuest) {
+      const updatedQuest = {
+        ...activeQuest,
+        waypoints: activeQuest.waypoints.map(wp => {
+          if (wp.id === checkInTarget.id) {
+            return {
+              ...wp,
+              checkIns: [...(wp.checkIns || []), checkIn]
+            };
+          }
+          return wp;
+        })
+      };
+      setActiveQuest(updatedQuest);
+      setQuests(prev => prev.map(q =>
+        q.id === updatedQuest.id ? updatedQuest : q
+      ));
+      // Award points for waypoint check-in
+      setTotalKP(prev => prev + 15);
+    } else if (checkInTarget.type === 'quest' && activeQuest) {
+      const updatedQuest = {
+        ...activeQuest,
+        checkIns: [...(activeQuest.checkIns || []), checkIn]
+      };
+      setActiveQuest(updatedQuest);
+      setQuests(prev => prev.map(q =>
+        q.id === updatedQuest.id ? updatedQuest : q
+      ));
+      // Award points for quest completion check-in
+      setTotalKP(prev => prev + 30);
+    }
+
+    // Reset camera state
+    setShowCheckInCamera(false);
+    setCapturedPhoto(null);
+    setCheckInTarget(null);
+
+    // Stop camera stream
+    if (checkInVideoRef.current && checkInVideoRef.current.srcObject) {
+      const stream = checkInVideoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
+      checkInVideoRef.current.srcObject = null;
+    }
+  }, [capturedPhoto, checkInTarget, myUserId, location, currentUser, activeQuest]);
+
+  // Start check-in camera
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+
+    const startCheckInCamera = async () => {
+      if (showCheckInCamera && checkInVideoRef.current) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false
+          });
+
+          if (checkInVideoRef.current) {
+            checkInVideoRef.current.srcObject = stream;
+            await checkInVideoRef.current.play();
+          }
+        } catch (err) {
+          console.error("Camera access failed for check-in:", err);
+          setErrorMsg("Could not access camera");
+          setShowCheckInCamera(false);
+        }
+      }
+    };
+
+    startCheckInCamera();
+
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [showCheckInCamera]);
+
+  // Start QR scanner camera
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+
+    const startQRScanner = async () => {
+      if (showQRScanner && qrVideoRef.current && qrCanvasRef.current) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false
+          });
+
+          if (qrVideoRef.current) {
+            qrVideoRef.current.srcObject = stream;
+            await qrVideoRef.current.play();
+
+            // Start scanning for QR codes
+            const canvas = qrCanvasRef.current;
+            const video = qrVideoRef.current;
+            const ctx = canvas.getContext('2d');
+
+            // Try to use native BarcodeDetector if available
+            if ('BarcodeDetector' in window) {
+              const barcodeDetector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+
+              qrScanIntervalRef.current = window.setInterval(async () => {
+                if (video.readyState === 4 && !qrScanResult) {
+                  canvas.width = video.videoWidth;
+                  canvas.height = video.videoHeight;
+                  ctx?.drawImage(video, 0, 0);
+
+                  try {
+                    const barcodes = await barcodeDetector.detect(canvas);
+                    if (barcodes.length > 0) {
+                      const qrData = barcodes[0].rawValue;
+                      // Check if it's a valid Kampung ID
+                      if (qrData.startsWith('KP-')) {
+                        setQrScanResult(qrData);
+                        if (qrScanIntervalRef.current) {
+                          clearInterval(qrScanIntervalRef.current);
+                        }
+                      }
+                    }
+                  } catch (err) {
+                    console.error('QR scan error:', err);
+                  }
+                }
+              }, 500); // Scan every 500ms
+            } else {
+              // Fallback: Simulate QR detection for demo
+              // In production, you'd use a library like jsQR here
+              console.log('BarcodeDetector not available. QR scanning requires a compatible browser or library.');
+              setErrorMsg('QR scanning not supported on this browser. Please enter the ID manually.');
+              setTimeout(() => setShowQRScanner(false), 3000);
+            }
+          }
+        } catch (err) {
+          console.error("Camera access failed for QR scanner:", err);
+          setErrorMsg("Could not access camera");
+          setShowQRScanner(false);
+        }
+      }
+    };
+
+    startQRScanner();
+
+    return () => {
+      if (qrScanIntervalRef.current) {
+        clearInterval(qrScanIntervalRef.current);
+      }
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [showQRScanner, qrScanResult]);
+
   // Watch user location for quest progress and provide navigation updates
   useEffect(() => {
     if (!activeQuest || activeQuest.status !== 'active' || !location) return;
@@ -1499,18 +2069,76 @@ const AppContent = () => {
 
       {/* Active Call Overlay */}
       {callState.isInCall && (
-          <div className="absolute inset-0 z-50 bg-slate-900 flex flex-col items-center justify-center animate-fade-in">
-              <div className="text-center">
-                  <div className="w-32 h-32 bg-teal-600 rounded-full flex items-center justify-center mx-auto mb-6">
-                      <Phone className="w-16 h-16 text-white animate-pulse" />
+          <div className="absolute inset-0 z-50 bg-slate-900 flex flex-col animate-fade-in">
+              {/* Remote Video (Full Screen) */}
+              <div className="flex-1 relative bg-slate-800">
+                  <video
+                      ref={remoteVideoRef}
+                      autoPlay
+                      playsInline
+                      className="w-full h-full object-cover"
+                  />
+
+                  {/* Call Info Overlay */}
+                  <div className="absolute top-4 left-4 right-4 flex justify-between items-start">
+                      <div className="bg-slate-900/80 backdrop-blur px-4 py-2 rounded-xl">
+                          <p className="text-white font-bold text-lg">{callState.remoteUserName || callState.remoteUserId}</p>
+                          <p className="text-gray-400 text-sm">
+                              {callState.callType === 'outgoing' ? 'Calling...' : 'Connected'}
+                          </p>
+                      </div>
                   </div>
-                  <h3 className="text-2xl font-bold text-white mb-2">
-                      {callState.callType === 'outgoing' ? 'Calling...' : 'In Call'}
-                  </h3>
-                  <p className="text-gray-400 mb-8">{callState.remoteUserName || callState.remoteUserId}</p>
+
+                  {/* Local Video (Picture-in-Picture) */}
+                  <div className="absolute bottom-20 right-4 w-32 h-40 bg-slate-700 rounded-2xl overflow-hidden border-2 border-white shadow-2xl">
+                      <video
+                          ref={localVideoRef}
+                          autoPlay
+                          playsInline
+                          muted
+                          className="w-full h-full object-cover transform -scale-x-100"
+                      />
+                  </div>
+              </div>
+
+              {/* Call Controls */}
+              <div className="p-6 bg-slate-900/95 backdrop-blur flex items-center justify-center gap-4">
+                  <button
+                      onClick={() => {
+                          if (localVideoRef.current && localVideoRef.current.srcObject) {
+                              const stream = localVideoRef.current.srcObject as MediaStream;
+                              const videoTrack = stream.getVideoTracks()[0];
+                              if (videoTrack) {
+                                  videoTrack.enabled = !videoTrack.enabled;
+                              }
+                          }
+                      }}
+                      className="p-4 bg-slate-700 rounded-full hover:bg-slate-600 transition"
+                      title="Toggle Camera"
+                  >
+                      {cameraOn ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
+                  </button>
+
+                  <button
+                      onClick={() => {
+                          if (localVideoRef.current && localVideoRef.current.srcObject) {
+                              const stream = localVideoRef.current.srcObject as MediaStream;
+                              const audioTrack = stream.getAudioTracks()[0];
+                              if (audioTrack) {
+                                  audioTrack.enabled = !audioTrack.enabled;
+                              }
+                          }
+                      }}
+                      className="p-4 bg-slate-700 rounded-full hover:bg-slate-600 transition"
+                      title="Toggle Microphone"
+                  >
+                      {micOn ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
+                  </button>
+
                   <button
                       onClick={endCall}
-                      className="p-6 bg-red-600 rounded-full hover:bg-red-700 transition"
+                      className="p-5 bg-red-600 rounded-full hover:bg-red-700 transition shadow-2xl"
+                      title="End Call"
                   >
                       <PhoneOff className="w-8 h-8" />
                   </button>
@@ -1581,8 +2209,8 @@ const AppContent = () => {
 
                   {/* Add Friend Tab */}
                   {connectTab === 'add' && (
-                      <div className="max-w-md mx-auto">
-                          <div className="mb-6">
+                      <div className="max-w-md mx-auto space-y-6">
+                          <div>
                               <label className="block text-sm font-medium text-gray-400 mb-2">
                                   Enter Friend's Kampung ID
                               </label>
@@ -1592,16 +2220,34 @@ const AppContent = () => {
                                       value={connectInput}
                                       onChange={(e) => setConnectInput(e.target.value)}
                                       placeholder="KP-XXXXXXXX"
-                                      className="flex-1 px-4 py-3 bg-slate-800 border border-slate-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-teal-400"
+                                      className="flex-1 px-4 py-3 bg-slate-800 border border-slate-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-teal-400 text-lg"
                                   />
                                   <button
                                       onClick={addConnection}
-                                      className="px-4 py-3 bg-teal-600 rounded-xl hover:bg-teal-500 transition"
+                                      className="px-5 py-3 bg-teal-600 rounded-xl hover:bg-teal-500 transition"
                                   >
-                                      <UserPlus className="w-5 h-5" />
+                                      <UserPlus className="w-6 h-6" />
                                   </button>
                               </div>
                           </div>
+
+                          <div className="relative">
+                              <div className="absolute inset-0 flex items-center">
+                                  <div className="w-full border-t border-slate-700"></div>
+                              </div>
+                              <div className="relative flex justify-center text-sm">
+                                  <span className="px-4 bg-slate-900 text-gray-400">OR</span>
+                              </div>
+                          </div>
+
+                          <button
+                              onClick={() => setShowQRScanner(true)}
+                              className="w-full py-4 bg-gradient-to-r from-teal-600 to-blue-600 text-white text-lg font-bold rounded-xl hover:from-teal-500 hover:to-blue-500 transition shadow-lg flex items-center justify-center gap-3"
+                          >
+                              <QrCode className="w-6 h-6" />
+                              Scan QR Code
+                          </button>
+
                           <p className="text-gray-400 text-center text-sm">
                               Ask your neighbor for their Kampung ID or scan their QR code
                           </p>
@@ -1638,7 +2284,15 @@ const AppContent = () => {
                                               }`} />
                                           </div>
                                           <div>
-                                              <p className="font-medium text-white">{friend.name}</p>
+                                              <div className="flex items-center gap-2">
+                                                  <p className="font-medium text-white">{friend.name}</p>
+                                                  {friend.kampungPoints !== undefined && (
+                                                      <span className="flex items-center gap-1 text-yellow-400 text-xs font-semibold">
+                                                          <Trophy size={12} />
+                                                          {friend.kampungPoints} KP
+                                                      </span>
+                                                  )}
+                                              </div>
                                               <p className="text-xs text-gray-400">{friend.id}</p>
                                           </div>
                                       </div>
@@ -1663,150 +2317,665 @@ const AppContent = () => {
       )}
 
       {mode === 'quest' && (
-          <div className="absolute inset-0 z-30 bg-slate-900 flex flex-col animate-fade-in">
+          <div className="absolute inset-0 z-30 bg-gradient-to-b from-slate-900 via-slate-900 to-teal-900/10 flex flex-col animate-fade-in">
              {/* Header */}
-             <div className="absolute top-0 left-0 right-0 p-4 flex justify-between items-center z-40 bg-slate-900/90 backdrop-blur-lg">
+             <div className="p-4 flex justify-between items-center bg-slate-900/95 backdrop-blur-lg border-b border-slate-800">
                 <div className="flex items-center gap-3">
-                   <button onClick={() => setMode('voice')} className="p-2 bg-slate-800 rounded-full hover:bg-slate-700 transition">
-                      <X className="w-6 h-6" />
+                   <button onClick={() => setMode('voice')} className="p-3 bg-slate-800 rounded-xl hover:bg-slate-700 transition">
+                      <Home className="w-6 h-6" />
                    </button>
                    <div>
-                      <h2 className="text-xl font-bold text-teal-400">Kampung Quest</h2>
-                      <p className="text-xs text-gray-400 flex items-center gap-2">
-                         <Trophy className="w-3 h-3" />
-                         {totalKP} KP
+                      <h2 className="text-2xl font-bold text-teal-400 flex items-center gap-2">
+                         <Sparkles className="w-6 h-6" />
+                         Kampung Quest
+                      </h2>
+                      <p className="text-sm text-gray-400 flex items-center gap-2 font-medium">
+                         <Trophy className="w-4 h-4 text-yellow-400" />
+                         {totalKP} Points
                       </p>
                    </div>
                 </div>
-                {activeQuest && (
+                {activeQuest && questView === 'map' && (
                    <button
                       onClick={cancelQuest}
-                      className="px-3 py-1 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition"
+                      className="px-4 py-2 bg-red-600 text-white text-base font-bold rounded-xl hover:bg-red-700 transition shadow-lg"
                    >
-                      Cancel Quest
+                      Cancel
                    </button>
                 )}
              </div>
 
-             {/* Map View */}
-             <div className="flex-1 relative mt-16">
-                <MapView
-                   userLocation={location}
-                   onSelectDestination={handleSelectDestination}
-                   activeQuest={activeQuest}
-                   onWaypointReached={handleWaypointReached}
-                />
+             {/* Navigation Tabs */}
+             <div className="flex border-b border-slate-800 bg-slate-900/80 backdrop-blur">
+                <button
+                   onClick={() => setQuestView('dashboard')}
+                   className={`flex-1 py-4 text-base font-bold transition flex items-center justify-center gap-2 ${
+                      questView === 'dashboard' ? 'text-teal-400 border-b-4 border-teal-400 bg-teal-900/20' : 'text-gray-400'
+                   }`}
+                >
+                   <TrendingUp className="w-5 h-5" />
+                   Dashboard
+                </button>
+                <button
+                   onClick={() => setQuestView('events')}
+                   className={`flex-1 py-4 text-base font-bold transition flex items-center justify-center gap-2 ${
+                      questView === 'events' ? 'text-teal-400 border-b-4 border-teal-400 bg-teal-900/20' : 'text-gray-400'
+                   }`}
+                >
+                   <Calendar className="w-5 h-5" />
+                   Events
+                </button>
+                <button
+                   onClick={() => setQuestView('map')}
+                   className={`flex-1 py-4 text-base font-bold transition flex items-center justify-center gap-2 ${
+                      questView === 'map' ? 'text-teal-400 border-b-4 border-teal-400 bg-teal-900/20' : 'text-gray-400'
+                   }`}
+                >
+                   <MapPinned className="w-5 h-5" />
+                   Map
+                </button>
+             </div>
 
-                {/* Active Quest Overlay */}
-                {activeQuest && (
-                   <div className="absolute bottom-4 left-4 right-4 bg-slate-900/95 backdrop-blur-lg rounded-2xl p-4 border border-slate-700">
-                      <div className="flex items-center justify-between mb-3">
-                         <div className="flex-1">
-                            <h3 className="font-bold text-white flex items-center gap-2">
-                               {activeQuest.type === 'fitness' && <Activity className="w-4 h-4 text-green-400" />}
-                               {activeQuest.type === 'community' && <MapPin className="w-4 h-4 text-blue-400" />}
-                               {activeQuest.type === 'exploration' && <Target className="w-4 h-4 text-purple-400" />}
-                               {activeQuest.title}
-                            </h3>
-                            <p className="text-xs text-gray-400 mt-1">
-                               {activeQuest.distance} km • {activeQuest.duration} min • {activeQuest.reward}
-                            </p>
-                         </div>
-                         <div className="text-right">
-                            <div className="text-2xl font-bold text-teal-400">{Math.round(activeQuest.progress)}%</div>
-                            <div className="text-xs text-gray-400">Complete</div>
-                         </div>
+             {/* Content */}
+             <div className="flex-1 overflow-y-auto">
+                {/* Dashboard View */}
+                {questView === 'dashboard' && (
+                   <div className="p-6 space-y-6">
+                      {/* Welcome Card */}
+                      <div className="bg-gradient-to-br from-teal-600 to-blue-600 rounded-3xl p-6 text-white shadow-2xl">
+                         <h3 className="text-2xl font-bold mb-2">Welcome back! 🎉</h3>
+                         <p className="text-lg opacity-90">
+                            {activeQuest
+                               ? `You're ${Math.round(activeQuest.progress)}% through your quest!`
+                               : 'Ready to explore your neighborhood?'
+                            }
+                         </p>
                       </div>
 
-                      {/* Progress Bar */}
-                      <div className="w-full bg-slate-800 rounded-full h-2 mb-3">
-                         <div
-                            className="bg-teal-400 h-2 rounded-full transition-all duration-500"
-                            style={{ width: `${activeQuest.progress}%` }}
-                         />
-                      </div>
-
-                      {/* Waypoints */}
-                      <div className="flex gap-2 flex-wrap">
-                         {activeQuest.waypoints.map((wp, idx) => (
-                            <div
-                               key={wp.id}
-                               className={`px-2 py-1 rounded-lg text-xs font-medium flex items-center gap-1 ${
-                                  wp.completed
-                                     ? 'bg-green-900/30 text-green-400 border border-green-800'
-                                     : 'bg-slate-800 text-gray-400 border border-slate-700'
-                               }`}
-                            >
-                               {wp.completed ? '✓' : idx + 1}
-                               <span>{wp.name}</span>
+                      {/* Active Quest Card */}
+                      {activeQuest && (
+                         <div className="bg-slate-800 rounded-2xl p-6 border-2 border-teal-500 shadow-lg">
+                            <div className="flex items-center justify-between mb-4">
+                               <h4 className="text-xl font-bold text-white flex items-center gap-2">
+                                  <Target className="w-6 h-6 text-teal-400" />
+                                  Active Quest
+                               </h4>
+                               <div className="text-3xl font-bold text-teal-400">{Math.round(activeQuest.progress)}%</div>
                             </div>
-                         ))}
-                      </div>
-                   </div>
-                )}
 
-                {/* Quest Selection Panel (when no active quest) */}
-                {!activeQuest && selectedDestination && (
-                   <div className="absolute bottom-4 left-4 right-4 bg-slate-900/95 backdrop-blur-lg rounded-2xl p-4 border border-slate-700">
-                      <h3 className="font-bold text-white mb-2">New Quest Available!</h3>
-                      <p className="text-sm text-gray-400 mb-3">
-                         Journey to {selectedDestination.name}
-                      </p>
-                      <button
-                         onClick={() => {
-                            const quest = quests[quests.length - 1]; // Get the most recent quest
-                            if (quest) startQuest(quest.id);
-                         }}
-                         className="w-full py-3 bg-teal-600 text-white font-bold rounded-xl hover:bg-teal-500 transition flex items-center justify-center gap-2"
-                      >
-                         <Play className="w-5 h-5" />
-                         Start Quest
-                      </button>
-                   </div>
-                )}
+                            <h5 className="text-lg font-bold text-white mb-2">{activeQuest.title}</h5>
+                            <p className="text-gray-400 mb-4">{activeQuest.description}</p>
 
-                {/* Available Quests List (when no destination selected) */}
-                {!activeQuest && !selectedDestination && quests.length > 0 && (
-                   <div className="absolute bottom-4 left-4 right-4 max-h-64 overflow-y-auto">
-                      <div className="bg-slate-900/95 backdrop-blur-lg rounded-2xl p-4 border border-slate-700">
-                         <h3 className="font-bold text-white mb-3">Available Quests</h3>
-                         <div className="space-y-2">
-                            {quests.filter(q => q.status === 'available').map(quest => (
-                               <div
-                                  key={quest.id}
-                                  className="flex items-center justify-between p-3 bg-slate-800 rounded-xl"
-                               >
-                                  <div className="flex-1">
-                                     <p className="font-medium text-white text-sm">{quest.title}</p>
-                                     <p className="text-xs text-gray-400">
-                                        {quest.distance} km • {quest.reward}
-                                     </p>
-                                  </div>
-                                  <button
-                                     onClick={() => startQuest(quest.id)}
-                                     className="px-3 py-1 bg-teal-600 text-white text-xs font-bold rounded-lg hover:bg-teal-500 transition"
-                                  >
-                                     GO
-                                  </button>
+                            <div className="grid grid-cols-3 gap-3 mb-4">
+                               <div className="bg-slate-700 rounded-xl p-3 text-center">
+                                  <MapPin className="w-5 h-5 text-teal-400 mx-auto mb-1" />
+                                  <p className="text-sm font-bold text-white">{activeQuest.distance} km</p>
                                </div>
-                            ))}
+                               <div className="bg-slate-700 rounded-xl p-3 text-center">
+                                  <Clock className="w-5 h-5 text-blue-400 mx-auto mb-1" />
+                                  <p className="text-sm font-bold text-white">{activeQuest.duration} min</p>
+                               </div>
+                               <div className="bg-slate-700 rounded-xl p-3 text-center">
+                                  <Award className="w-5 h-5 text-yellow-400 mx-auto mb-1" />
+                                  <p className="text-sm font-bold text-white">{activeQuest.reward}</p>
+                               </div>
+                            </div>
+
+                            <div className="w-full bg-slate-700 rounded-full h-3 mb-4">
+                               <div
+                                  className="bg-gradient-to-r from-teal-400 to-blue-500 h-3 rounded-full transition-all duration-500"
+                                  style={{ width: `${activeQuest.progress}%` }}
+                               />
+                            </div>
+
+                            <button
+                               onClick={() => setQuestView('map')}
+                               className="w-full py-4 bg-teal-600 text-white text-lg font-bold rounded-xl hover:bg-teal-500 transition flex items-center justify-center gap-2 shadow-lg"
+                            >
+                               <MapPinned className="w-6 h-6" />
+                               View Map
+                            </button>
+                         </div>
+                      )}
+
+                      {/* Today's Events */}
+                      <div>
+                         <h4 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
+                            <Calendar className="w-6 h-6 text-teal-400" />
+                            Nearby Events
+                         </h4>
+                         <div className="space-y-3">
+                            {communityEvents.slice(0, 3).map(event => {
+                               const isJoined = event.participants.includes(myUserId);
+                               const getCategoryColor = (cat: string) => {
+                                  switch (cat) {
+                                     case 'fitness': return 'from-green-600 to-emerald-600';
+                                     case 'social': return 'from-blue-600 to-cyan-600';
+                                     case 'food': return 'from-orange-600 to-yellow-600';
+                                     case 'arts': return 'from-pink-600 to-purple-600';
+                                     case 'education': return 'from-purple-600 to-indigo-600';
+                                     default: return 'from-gray-600 to-slate-600';
+                                  }
+                               };
+
+                               return (
+                                  <div key={event.id} className={`bg-gradient-to-r ${getCategoryColor(event.category)} rounded-2xl p-5 shadow-lg`}>
+                                     <div className="flex items-start justify-between mb-3">
+                                        <div className="flex-1">
+                                           <h5 className="text-lg font-bold text-white mb-1">{event.name}</h5>
+                                           <p className="text-sm text-white/80">{event.description}</p>
+                                        </div>
+                                     </div>
+                                     <div className="flex items-center gap-3 text-sm text-white/90 mb-3">
+                                        <span className="flex items-center gap-1">
+                                           <Clock className="w-4 h-4" />
+                                           {event.time}
+                                        </span>
+                                        <span className="flex items-center gap-1">
+                                           <Users className="w-4 h-4" />
+                                           {event.participants.length}/{event.maxParticipants}
+                                        </span>
+                                        <span className="flex items-center gap-1">
+                                           <Award className="w-4 h-4" />
+                                           {event.reward}
+                                        </span>
+                                     </div>
+                                     <div className="space-y-2">
+                                        <div className="flex gap-2">
+                                           <button
+                                              onClick={() => isJoined ? leaveEvent(event.id) : joinEvent(event.id)}
+                                              className={`flex-1 py-3 text-base font-bold rounded-xl transition shadow-lg ${
+                                                 isJoined
+                                                    ? 'bg-white/20 text-white border-2 border-white'
+                                                    : 'bg-white text-slate-900 hover:bg-gray-100'
+                                              }`}
+                                           >
+                                              {isJoined ? '✓ Joined' : 'Join Event'}
+                                           </button>
+                                           {isJoined && (
+                                              <button
+                                                 onClick={() => openCheckInCamera({ type: 'event', id: event.id })}
+                                                 className="px-5 py-3 bg-white text-slate-900 text-base font-bold rounded-xl hover:bg-gray-100 transition shadow-lg flex items-center gap-2"
+                                              >
+                                                 <Camera className="w-5 h-5" />
+                                                 Check In
+                                              </button>
+                                           )}
+                                        </div>
+                                        <button
+                                           onClick={() => navigateToEvent(event)}
+                                           className="w-full py-3 bg-white/30 text-white text-base font-bold rounded-xl hover:bg-white/40 transition border-2 border-white/50 flex items-center justify-center gap-2"
+                                        >
+                                           <Navigation className="w-5 h-5" />
+                                           Get Directions
+                                        </button>
+                                     </div>
+                                  </div>
+                               );
+                            })}
+                         </div>
+                         <button
+                            onClick={() => setQuestView('events')}
+                            className="w-full mt-4 py-4 bg-slate-800 text-white text-lg font-bold rounded-xl hover:bg-slate-700 transition border-2 border-slate-700"
+                         >
+                            View All Events
+                         </button>
+                      </div>
+
+                      {/* Community Feed (Shared Photos) */}
+                      <div>
+                         <div className="flex items-center justify-between mb-4">
+                            <h4 className="text-xl font-bold text-white flex items-center gap-2">
+                               <Image className="w-6 h-6 text-teal-400" />
+                               Community Moments
+                            </h4>
+                            <button
+                               onClick={() => setShowPhotoGallery(true)}
+                               className="text-teal-400 text-sm font-bold hover:underline"
+                            >
+                               View All
+                            </button>
+                         </div>
+                         <div className="grid grid-cols-3 gap-3">
+                            {(() => {
+                               // Collect all check-ins from events, quests, and waypoints
+                               const allCheckIns = [
+                                  ...communityEvents.flatMap(e => e.checkIns),
+                                  ...quests.flatMap(q => q.checkIns || []),
+                                  ...quests.flatMap(q => q.waypoints.flatMap(wp => wp.checkIns || []))
+                               ];
+
+                               // Sort by timestamp (newest first) and take first 6
+                               const recentCheckIns = allCheckIns
+                                  .sort((a, b) => b.timestamp - a.timestamp)
+                                  .slice(0, 6);
+
+                               if (recentCheckIns.length === 0) {
+                                  return (
+                                     <div className="col-span-3 text-center py-8 text-gray-400">
+                                        <Camera className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                                        <p>No photos yet. Check in at events to share moments!</p>
+                                     </div>
+                                  );
+                               }
+
+                               return recentCheckIns.map((checkIn, idx) => (
+                                  <div key={idx} className="aspect-square rounded-xl overflow-hidden border-2 border-slate-700 hover:border-teal-400 transition cursor-pointer">
+                                     <img src={checkIn.photoUrl} alt="Check-in" className="w-full h-full object-cover" />
+                                  </div>
+                               ));
+                            })()}
                          </div>
                       </div>
                    </div>
                 )}
 
-                {/* Instructions when no location */}
-                {!location && (
-                   <div className="absolute inset-0 flex items-center justify-center bg-slate-900/95 backdrop-blur-lg">
-                      <div className="text-center">
-                         <MapPin className="w-16 h-16 text-teal-400 mx-auto mb-4" />
-                         <h3 className="text-xl font-bold text-white mb-2">Location Required</h3>
-                         <p className="text-gray-400">Please enable location access to use quests</p>
+                {/* Events Discovery View */}
+                {questView === 'events' && (
+                   <div className="p-6 space-y-4">
+                      <div className="mb-4">
+                         <h3 className="text-2xl font-bold text-white mb-2">Discover Events</h3>
+                         <p className="text-gray-400 text-lg">Join activities and connect with neighbors!</p>
                       </div>
+
+                      {communityEvents.map(event => {
+                         const isJoined = event.participants.includes(myUserId);
+                         const getCategoryColor = (cat: string) => {
+                            switch (cat) {
+                               case 'fitness': return { bg: 'from-green-600 to-emerald-600', icon: '🏃' };
+                               case 'social': return { bg: 'from-blue-600 to-cyan-600', icon: '👥' };
+                               case 'food': return { bg: 'from-orange-600 to-yellow-600', icon: '🍜' };
+                               case 'arts': return { bg: 'from-pink-600 to-purple-600', icon: '🎨' };
+                               case 'education': return { bg: 'from-purple-600 to-indigo-600', icon: '📚' };
+                               default: return { bg: 'from-gray-600 to-slate-600', icon: '📍' };
+                            }
+                         };
+
+                         const style = getCategoryColor(event.category);
+
+                         return (
+                            <div key={event.id} className={`bg-gradient-to-r ${style.bg} rounded-3xl p-6 shadow-2xl`}>
+                               <div className="flex items-start gap-4 mb-4">
+                                  <div className="text-5xl">{style.icon}</div>
+                                  <div className="flex-1">
+                                     <h4 className="text-2xl font-bold text-white mb-2">{event.name}</h4>
+                                     <p className="text-lg text-white/90 mb-3">{event.description}</p>
+
+                                     <div className="grid grid-cols-2 gap-3 mb-4">
+                                        <div className="bg-white/20 rounded-xl p-3">
+                                           <p className="text-sm text-white/70 mb-1">Time</p>
+                                           <p className="text-base font-bold text-white">{event.time}</p>
+                                        </div>
+                                        <div className="bg-white/20 rounded-xl p-3">
+                                           <p className="text-sm text-white/70 mb-1">Spots Left</p>
+                                           <p className="text-base font-bold text-white">
+                                              {event.maxParticipants ? event.maxParticipants - event.participants.length : '∞'}
+                                           </p>
+                                        </div>
+                                        <div className="bg-white/20 rounded-xl p-3">
+                                           <p className="text-sm text-white/70 mb-1">Reward</p>
+                                           <p className="text-base font-bold text-white">{event.reward}</p>
+                                        </div>
+                                        <div className="bg-white/20 rounded-xl p-3">
+                                           <p className="text-sm text-white/70 mb-1">Joined</p>
+                                           <p className="text-base font-bold text-white">{event.participants.length} people</p>
+                                        </div>
+                                     </div>
+
+                                     <div className="space-y-3">
+                                        <div className="flex gap-3">
+                                           <button
+                                              onClick={() => isJoined ? leaveEvent(event.id) : joinEvent(event.id)}
+                                              className={`flex-1 py-4 text-lg font-bold rounded-xl transition shadow-lg ${
+                                                 isJoined
+                                                    ? 'bg-white/20 text-white border-2 border-white'
+                                                    : 'bg-white text-slate-900 hover:bg-gray-100'
+                                              }`}
+                                           >
+                                              {isJoined ? '✓ Joined' : 'Join Event'}
+                                           </button>
+                                           {isJoined && (
+                                              <button
+                                                 onClick={() => openCheckInCamera({ type: 'event', id: event.id })}
+                                                 className="px-6 py-4 bg-white text-slate-900 text-lg font-bold rounded-xl hover:bg-gray-100 transition shadow-lg flex items-center gap-2"
+                                              >
+                                                 <Camera className="w-6 h-6" />
+                                                 Check In
+                                              </button>
+                                           )}
+                                        </div>
+                                        <button
+                                           onClick={() => navigateToEvent(event)}
+                                           className="w-full py-4 bg-white/30 text-white text-lg font-bold rounded-xl hover:bg-white/40 transition border-2 border-white/50 flex items-center justify-center gap-2"
+                                        >
+                                           <Navigation className="w-6 h-6" />
+                                           Get Directions
+                                        </button>
+                                     </div>
+
+                                     {/* Event Check-ins */}
+                                     {event.checkIns.length > 0 && (
+                                        <div className="mt-4">
+                                           <p className="text-sm text-white/80 mb-2">{event.checkIns.length} check-ins</p>
+                                           <div className="flex gap-2 overflow-x-auto">
+                                              {event.checkIns.slice(0, 5).map((checkIn, idx) => (
+                                                 <img
+                                                    key={idx}
+                                                    src={checkIn.photoUrl}
+                                                    alt="Check-in"
+                                                    className="w-20 h-20 rounded-xl object-cover border-2 border-white/30"
+                                                 />
+                                              ))}
+                                           </div>
+                                        </div>
+                                     )}
+                                  </div>
+                               </div>
+                            </div>
+                         );
+                      })}
+                   </div>
+                )}
+
+                {/* Map View */}
+                {questView === 'map' && (
+                   <div className="relative h-full">
+                      <MapView
+                         userLocation={location}
+                         onSelectDestination={handleSelectDestination}
+                         activeQuest={activeQuest}
+                         onWaypointReached={handleWaypointReached}
+                         communityEvents={communityEvents}
+                         onEventSelect={setSelectedEvent}
+                         showEvents={true}
+                      />
+
+                      {/* Active Quest Overlay */}
+                      {activeQuest && (
+                         <div className="absolute bottom-4 left-4 right-4 bg-slate-900/95 backdrop-blur-lg rounded-2xl p-4 border-2 border-teal-500 shadow-2xl">
+                            <div className="flex items-center justify-between mb-3">
+                               <div className="flex-1">
+                                  <h3 className="font-bold text-white text-lg">{activeQuest.title}</h3>
+                                  <p className="text-sm text-gray-400 mt-1">
+                                     {activeQuest.distance} km • {activeQuest.duration} min • {activeQuest.reward}
+                                  </p>
+                               </div>
+                               <div className="text-right">
+                                  <div className="text-3xl font-bold text-teal-400">{Math.round(activeQuest.progress)}%</div>
+                               </div>
+                            </div>
+
+                            <div className="w-full bg-slate-800 rounded-full h-3 mb-3">
+                               <div
+                                  className="bg-gradient-to-r from-teal-400 to-blue-500 h-3 rounded-full transition-all duration-500"
+                                  style={{ width: `${activeQuest.progress}%` }}
+                               />
+                            </div>
+
+                            <button
+                               onClick={() => openCheckInCamera({ type: 'quest', id: activeQuest.id })}
+                               className="w-full py-3 bg-teal-600 text-white text-lg font-bold rounded-xl hover:bg-teal-500 transition flex items-center justify-center gap-2"
+                            >
+                               <Camera className="w-5 h-5" />
+                               Take Photo
+                            </button>
+                         </div>
+                      )}
+
+                      {/* Selected Event Overlay */}
+                      {selectedEvent && !activeQuest && (
+                         <div className="absolute bottom-4 left-4 right-4 bg-slate-900/95 backdrop-blur-lg rounded-2xl p-5 border-2 border-blue-500 shadow-2xl">
+                            <h3 className="font-bold text-white text-xl mb-2">{selectedEvent.name}</h3>
+                            <p className="text-gray-300 mb-3">{selectedEvent.description}</p>
+                            <div className="flex gap-2 mb-4 text-sm text-gray-400">
+                               <span className="flex items-center gap-1"><Clock className="w-4 h-4" />{selectedEvent.time}</span>
+                               <span className="flex items-center gap-1"><Award className="w-4 h-4" />{selectedEvent.reward}</span>
+                            </div>
+                            <div className="flex gap-2">
+                               <button
+                                  onClick={() => {
+                                     joinEvent(selectedEvent.id);
+                                     setSelectedEvent(null);
+                                  }}
+                                  className="flex-1 py-3 bg-blue-600 text-white text-lg font-bold rounded-xl hover:bg-blue-500 transition"
+                               >
+                                  Join Event
+                               </button>
+                               <button
+                                  onClick={() => setSelectedEvent(null)}
+                                  className="px-4 py-3 bg-slate-800 text-white rounded-xl hover:bg-slate-700 transition"
+                               >
+                                  <X className="w-5 h-5" />
+                               </button>
+                            </div>
+                         </div>
+                      )}
+
+                      {/* Location Required */}
+                      {!location && (
+                         <div className="absolute inset-0 flex items-center justify-center bg-slate-900/95 backdrop-blur-lg">
+                            <div className="text-center">
+                               <MapPin className="w-20 h-20 text-teal-400 mx-auto mb-4" />
+                               <h3 className="text-2xl font-bold text-white mb-2">Location Required</h3>
+                               <p className="text-gray-400 text-lg">Please enable location access to use quests</p>
+                            </div>
+                         </div>
+                      )}
                    </div>
                 )}
              </div>
           </div>
+      )}
+
+      {/* Check-In Camera Modal */}
+      {showCheckInCamera && (
+         <div className="absolute inset-0 z-50 bg-black flex flex-col">
+            <div className="p-4 bg-slate-900/90 backdrop-blur flex items-center justify-between flex-shrink-0">
+               <h3 className="text-xl font-bold text-white">Take a Photo</h3>
+               <button
+                  onClick={() => {
+                     setShowCheckInCamera(false);
+                     setCapturedPhoto(null);
+                     if (checkInVideoRef.current?.srcObject) {
+                        const stream = checkInVideoRef.current.srcObject as MediaStream;
+                        stream.getTracks().forEach(track => track.stop());
+                     }
+                  }}
+                  className="p-2 bg-slate-800 rounded-full"
+               >
+                  <X className="w-6 h-6" />
+               </button>
+            </div>
+
+            <div className="relative flex-1 min-h-0 max-h-[60vh]">
+               <video
+                  ref={checkInVideoRef}
+                  autoPlay
+                  playsInline
+                  className="w-full h-full object-cover transform -scale-x-100"
+               />
+               <canvas ref={checkInCanvasRef} className="hidden" />
+
+               {capturedPhoto && (
+                  <img
+                     src={capturedPhoto}
+                     alt="Captured"
+                     className="absolute inset-0 w-full h-full object-cover"
+                  />
+               )}
+            </div>
+
+            <div className="p-4 bg-slate-900/90 backdrop-blur flex-shrink-0">
+               {!capturedPhoto ? (
+                  <button
+                     onClick={captureCheckInPhoto}
+                     className="w-full py-4 bg-teal-600 text-white text-lg font-bold rounded-full hover:bg-teal-500 transition flex items-center justify-center gap-2 shadow-2xl"
+                  >
+                     <Camera className="w-6 h-6" />
+                     Capture Photo
+                  </button>
+               ) : (
+                  <div className="space-y-2">
+                     <button
+                        onClick={submitCheckIn}
+                        className="w-full py-4 bg-green-600 text-white text-lg font-bold rounded-full hover:bg-green-500 transition flex items-center justify-center gap-2 shadow-2xl"
+                     >
+                        <Check className="w-6 h-6" />
+                        Submit Check-In
+                     </button>
+                     <button
+                        onClick={() => setCapturedPhoto(null)}
+                        className="w-full py-3 bg-slate-800 text-white text-base font-bold rounded-full hover:bg-slate-700 transition"
+                     >
+                        Retake Photo
+                     </button>
+                  </div>
+               )}
+            </div>
+         </div>
+      )}
+
+      {/* Photo Gallery Modal */}
+      {showPhotoGallery && (
+         <div className="absolute inset-0 z-50 bg-slate-900 flex flex-col">
+            <div className="p-4 bg-slate-800 flex items-center justify-between">
+               <h3 className="text-xl font-bold text-white">Community Moments</h3>
+               <button
+                  onClick={() => setShowPhotoGallery(false)}
+                  className="p-2 bg-slate-700 rounded-full"
+               >
+                  <X className="w-6 h-6" />
+               </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4">
+               <div className="grid grid-cols-2 gap-3">
+                  {(() => {
+                     // Collect all check-ins from events, quests, and waypoints
+                     const allCheckIns = [
+                        ...communityEvents.flatMap(e => e.checkIns),
+                        ...quests.flatMap(q => q.checkIns || []),
+                        ...quests.flatMap(q => q.waypoints.flatMap(wp => wp.checkIns || []))
+                     ];
+
+                     // Sort by timestamp (newest first)
+                     const sortedCheckIns = allCheckIns.sort((a, b) => b.timestamp - a.timestamp);
+
+                     if (sortedCheckIns.length === 0) {
+                        return (
+                           <div className="col-span-2 text-center py-16 text-gray-400">
+                              <Camera className="w-16 h-16 mx-auto mb-4 opacity-50" />
+                              <p className="text-lg">No photos yet</p>
+                              <p className="text-sm mt-2">Check in at events and quests to share moments with the community!</p>
+                           </div>
+                        );
+                     }
+
+                     return sortedCheckIns.map((checkIn, idx) => (
+                        <div key={idx} className="bg-slate-800 rounded-2xl overflow-hidden">
+                           <img src={checkIn.photoUrl} alt="Check-in" className="w-full aspect-square object-cover" />
+                           <div className="p-3">
+                              <p className="text-white font-bold">{checkIn.userName}</p>
+                              <p className="text-gray-400 text-sm">
+                                 {new Date(checkIn.timestamp).toLocaleDateString()} at {new Date(checkIn.timestamp).toLocaleTimeString()}
+                              </p>
+                           </div>
+                        </div>
+                     ));
+                  })()}
+               </div>
+            </div>
+         </div>
+      )}
+
+      {/* QR Scanner Modal */}
+      {showQRScanner && (
+         <div className="absolute inset-0 z-50 bg-black flex flex-col">
+            <div className="p-4 bg-slate-900/90 backdrop-blur flex items-center justify-between">
+               <h3 className="text-xl font-bold text-white">Scan QR Code</h3>
+               <button
+                  onClick={() => {
+                     setShowQRScanner(false);
+                     setQrScanResult(null);
+                     if (qrScanIntervalRef.current) {
+                        clearInterval(qrScanIntervalRef.current);
+                     }
+                     if (qrVideoRef.current?.srcObject) {
+                        const stream = qrVideoRef.current.srcObject as MediaStream;
+                        stream.getTracks().forEach(track => track.stop());
+                     }
+                  }}
+                  className="p-2 bg-slate-800 rounded-full"
+               >
+                  <X className="w-6 h-6" />
+               </button>
+            </div>
+
+            <div className="flex-1 relative bg-slate-800 flex items-center justify-center">
+               <video
+                  ref={qrVideoRef}
+                  autoPlay
+                  playsInline
+                  className="max-w-full max-h-full object-contain"
+               />
+               <canvas ref={qrCanvasRef} className="hidden" />
+
+               {/* Scanning Overlay */}
+               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="relative w-64 h-64">
+                     {/* Corner brackets */}
+                     <div className="absolute top-0 left-0 w-16 h-16 border-t-4 border-l-4 border-teal-400"></div>
+                     <div className="absolute top-0 right-0 w-16 h-16 border-t-4 border-r-4 border-teal-400"></div>
+                     <div className="absolute bottom-0 left-0 w-16 h-16 border-b-4 border-l-4 border-teal-400"></div>
+                     <div className="absolute bottom-0 right-0 w-16 h-16 border-b-4 border-r-4 border-teal-400"></div>
+
+                     {/* Scanning line animation */}
+                     <div className="absolute inset-0 overflow-hidden">
+                        <div className="absolute w-full h-1 bg-teal-400 animate-scan"></div>
+                     </div>
+                  </div>
+               </div>
+
+               {qrScanResult && (
+                  <div className="absolute inset-0 bg-black/80 backdrop-blur flex items-center justify-center">
+                     <div className="bg-slate-800 rounded-2xl p-6 max-w-sm mx-4 text-center">
+                        <div className="w-16 h-16 bg-green-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                           <Check className="w-10 h-10 text-white" />
+                        </div>
+                        <h4 className="text-xl font-bold text-white mb-2">QR Code Detected!</h4>
+                        <p className="text-gray-300 mb-4">Found Kampung ID:</p>
+                        <p className="text-teal-400 font-mono text-lg mb-6">{qrScanResult}</p>
+                        <button
+                           onClick={() => {
+                              setConnectInput(qrScanResult);
+                              setShowQRScanner(false);
+                              setQrScanResult(null);
+                              if (qrScanIntervalRef.current) {
+                                 clearInterval(qrScanIntervalRef.current);
+                              }
+                              if (qrVideoRef.current?.srcObject) {
+                                 const stream = qrVideoRef.current.srcObject as MediaStream;
+                                 stream.getTracks().forEach(track => track.stop());
+                              }
+                              // Switch to add tab and auto-add
+                              setConnectTab('add');
+                              setTimeout(() => addConnection(), 100);
+                           }}
+                           className="w-full py-3 bg-teal-600 text-white text-lg font-bold rounded-xl hover:bg-teal-500 transition"
+                        >
+                           Add Friend
+                        </button>
+                     </div>
+                  </div>
+               )}
+            </div>
+
+            <div className="p-6 bg-slate-900/90 backdrop-blur text-center">
+               <p className="text-gray-400 text-lg">
+                  Position the QR code within the frame
+               </p>
+            </div>
+         </div>
       )}
 
     </div>

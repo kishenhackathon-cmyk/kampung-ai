@@ -16,7 +16,8 @@
       "Bash(mkdir:*)",
       "Bash(npx tsc:*)",
       "mcp__chrome-devtools__list_pages",
-      "mcp__chrome-devtools__fill_form"
+      "mcp__chrome-devtools__fill_form",
+      "Bash(npm run build:*)"
     ],
     "deny": [],
     "ask": []
